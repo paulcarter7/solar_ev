@@ -1,0 +1,37 @@
+I want to build a Home Energy Optimizer — a personal web app that helps me decide when to charge my EV by combining my home solar production data, time-of-use electricity rates, and weather forecasts.
+My setup:
+
+Solar inverter: [Enphase / SolarEdge — fill in yours]
+EV: [Tesla / Rivian / other — fill in yours, or "none yet" if you want to skip this]
+Utility: [your utility company name, e.g. PG&E]
+
+What I want to build:
+A React frontend + serverless AWS backend with the following:
+
+A dashboard showing today's solar production (actual + forecast)
+A timeline showing my utility's time-of-use rate periods
+A simple recommendation: best window to charge my EV today
+Historical data stored so I can see trends over time
+
+Tech stack:
+
+Frontend: React (with Recharts for graphs, Tailwind for styling)
+Backend: AWS Lambda (Python), API Gateway
+Database: DynamoDB (time-series energy readings + user config)
+Infrastructure: AWS CDK (TypeScript) so everything is defined as code
+Scheduling: EventBridge to pull solar + weather data hourly
+External APIs I plan to integrate: Enphase Enlighten API, OpenWeatherMap API
+
+My goals beyond the app itself:
+
+Learn how AWS Lambda, DynamoDB, and CDK work in practice
+Get comfortable with modern React patterns (hooks, data fetching)
+Build good habits around project structure and infrastructure-as-code
+
+Please start by:
+
+Scaffolding the full project structure (frontend + CDK infra + Lambda functions)
+Creating a working "hello world" for each layer — a Lambda that returns mock solar data, an API Gateway endpoint that calls it, and a React component that fetches and displays it
+Adding a README with setup instructions (AWS CLI, CDK bootstrap, npm install, how to run locally)
+
+Keep the initial code simple and working end-to-end rather than feature-complete. I want to be able to run it locally and deploy to AWS on day one, then iterate from there.
