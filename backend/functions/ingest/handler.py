@@ -204,10 +204,42 @@ def _fetch_enphase_summary(
 
 
 # ---------------------------------------------------------------------------
+# Battery SOC
+# ---------------------------------------------------------------------------
+
+def _fetch_battery_soc(system_id: str, api_key: str, access_token: str) -> int | None:
+    """
+    Call the Enphase battery telemetry endpoint and return the most-recent
+    state-of-charge as a whole-number percentage (0-100), or None on failure.
+    """
+    try:
+        url = f"{ENPHASE_BASE}/systems/{system_id}/telemetry/battery?key={api_key}"
+        req = Request(url, headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+        })
+        with urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+
+        intervals = data.get("intervals", [])
+        if intervals:
+            soc = intervals[-1].get("soc", {}).get("percent")
+            if soc is not None:
+                soc_int = round(float(soc))
+                logger.info("Battery SOC: %d%%", soc_int)
+                return soc_int
+        logger.info("Battery telemetry returned no intervals")
+        return None
+    except Exception as exc:
+        logger.warning("Battery SOC fetch failed (%s) — skipping", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # DynamoDB
 # ---------------------------------------------------------------------------
 
-def _write_reading(table, system_id: str, summary: dict) -> None:
+def _write_reading(table, system_id: str, summary: dict, battery_soc_pct: int | None = None) -> None:
     """Write one snapshot row to DynamoDB with a 90-day TTL."""
     now = datetime.now(timezone.utc)
     ttl = int((now + timedelta(days=90)).timestamp())
@@ -228,10 +260,13 @@ def _write_reading(table, system_id: str, summary: dict) -> None:
         "ingested_at":  now.isoformat(),
         "ttl":          ttl,
     }
+    if battery_soc_pct is not None:
+        item["battery_soc_pct"] = battery_soc_pct
     table.put_item(Item=item)
     logger.info(
-        "Wrote reading: deviceId=%s timestamp=%s energy_wh=%s power_w=%s",
+        "Wrote reading: deviceId=%s timestamp=%s energy_wh=%s power_w=%s battery_soc=%s%%",
         item["deviceId"], ts, item["energy_wh"], item["power_w"],
+        battery_soc_pct if battery_soc_pct is not None else "n/a",
     )
 
 
@@ -258,8 +293,10 @@ def lambda_handler(event: dict, context) -> dict:
         summary = _fetch_enphase_summary(
             system_id, api_key, access_token, client_id, client_secret
         )
+        # Fetch battery SOC in parallel (non-fatal if it fails)
+        battery_soc_pct = _fetch_battery_soc(system_id, api_key, access_token)
         table = _dynamo.Table(table_name)
-        _write_reading(table, system_id, summary)
+        _write_reading(table, system_id, summary, battery_soc_pct=battery_soc_pct)
     except Exception as exc:
         logger.exception("Enphase ingest failed: %s", exc)
         return {
@@ -274,5 +311,6 @@ def lambda_handler(event: dict, context) -> dict:
             "status":          "ok",
             "energy_today_wh": summary.get("energy_today"),
             "current_power_w": summary.get("current_power"),
+            "battery_soc_pct": battery_soc_pct,
         }),
     }

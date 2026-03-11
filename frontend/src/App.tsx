@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { fetchSolarToday, fetchRecommendation } from "./api/solar";
 import type { SolarTodayResponse, RecommendationResponse } from "./api/solar";
 import { SolarChart } from "./components/SolarChart";
@@ -22,20 +22,48 @@ export default function App() {
     error: null,
   });
 
+  // SOC = State of Charge (battery %). Default 30%, target 80%.
+  const [currentSoc, setCurrentSoc] = useState(30);
+  const [recLoading, setRecLoading] = useState(false);
+
+  // Prevents the SOC-change effect from firing before the initial load completes.
+  const initialized = useRef(false);
+
+  // Initial load — fetch solar data and first recommendation in parallel.
   useEffect(() => {
     setState((s) => ({ ...s, status: "loading" }));
 
     // Use the local date so the requested day matches the user's clock,
     // not UTC (which can be a day ahead after ~4 pm Pacific).
     const localToday = new Date().toLocaleDateString("en-CA"); // → YYYY-MM-DD
-    Promise.all([fetchSolarToday(localToday), fetchRecommendation({ current_soc: 0.3, target_soc: 0.8, date: localToday })])
+    Promise.all([
+      fetchSolarToday(localToday),
+      fetchRecommendation({ current_soc: currentSoc / 100, target_soc: 0.8, date: localToday }),
+    ])
       .then(([solar, recommendation]) => {
+        initialized.current = true;
         setState({ solar, recommendation, status: "success", error: null });
       })
       .catch((err: Error) => {
         setState((s) => ({ ...s, status: "error", error: err.message }));
       });
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Re-fetch recommendation whenever SOC slider changes (debounced 400 ms).
+  useEffect(() => {
+    if (!initialized.current) return;
+    setRecLoading(true);
+    const localToday = new Date().toLocaleDateString("en-CA");
+    const timer = setTimeout(() => {
+      fetchRecommendation({ current_soc: currentSoc / 100, target_soc: 0.8, date: localToday })
+        .then((rec) => {
+          setState((s) => ({ ...s, recommendation: rec }));
+          setRecLoading(false);
+        })
+        .catch(() => setRecLoading(false));
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [currentSoc]);
 
   const { solar, recommendation, status, error } = state;
 
@@ -114,8 +142,41 @@ export default function App() {
               <TouTimeline schedule={solar.tou_schedule} />
             </section>
 
-            {/* Recommendation */}
-            <RecommendationCard data={recommendation} />
+            {/* SOC input + Recommendation */}
+            <section className="rounded-2xl bg-gray-800 border border-gray-700 p-5 space-y-4">
+              {/* Battery slider */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-sm font-semibold text-gray-200">
+                    🔋 Current battery level
+                  </label>
+                  <span className="text-lg font-bold text-blue-400">{currentSoc}%</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={5}
+                  value={currentSoc}
+                  onChange={(e) => setCurrentSoc(Number(e.target.value))}
+                  className="w-full h-2 rounded-full appearance-none cursor-pointer
+                    bg-gray-700 accent-blue-500"
+                />
+                <div className="flex justify-between text-xs text-gray-600">
+                  <span>0%</span>
+                  <span className="text-gray-500">Target: 80%</span>
+                  <span>100%</span>
+                </div>
+              </div>
+
+              {/* Recommendation (dims while re-fetching) */}
+              <div className={recLoading ? "opacity-50 pointer-events-none transition-opacity" : "transition-opacity"}>
+                <RecommendationCard data={recommendation} />
+              </div>
+              {recLoading && (
+                <p className="text-xs text-center text-gray-500 animate-pulse">Updating recommendation…</p>
+              )}
+            </section>
 
             {/* Alternate windows table */}
             <section className="rounded-2xl bg-gray-800 border border-gray-700 p-5 space-y-3">

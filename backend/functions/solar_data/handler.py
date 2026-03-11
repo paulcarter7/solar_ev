@@ -202,8 +202,9 @@ def lambda_handler(event: dict, context: Any) -> dict:
         system_id  = os.environ.get("ENPHASE_SYSTEM_ID", "")
         table_name = os.environ.get("ENERGY_TABLE", "")
 
-        readings    = None
-        data_source = "mock"
+        readings         = None
+        data_source      = "mock"
+        battery_soc_pct  = None   # home battery SOC %, filled from latest DynamoDB item
 
         # --- Real data from DynamoDB ---
         if system_id and table_name:
@@ -216,6 +217,11 @@ def lambda_handler(event: dict, context: Any) -> dict:
                         "DynamoDB returned %d snapshot(s) for local date %s",
                         len(items), date_str
                     )
+                    # Most-recent item that includes a battery SOC reading
+                    for item in reversed(items):
+                        if "battery_soc_pct" in item:
+                            battery_soc_pct = int(item["battery_soc_pct"])
+                            break
                 else:
                     logger.info("No DynamoDB rows for %s — using mock data", date_str)
             except Exception as exc:
@@ -229,13 +235,15 @@ def lambda_handler(event: dict, context: Any) -> dict:
         total_wh = sum(r["production_wh"] for r in readings)
 
         payload = {
-            "date":                  date_str,
-            "system_id":             system_id or "mock-system",
-            "total_production_wh":   total_wh,
-            "total_production_kwh":  round(total_wh / 1000, 2),
-            "hourly_readings":       readings,
-            "tou_schedule":          TOU_SCHEDULE,
-            "data_source":           data_source,
+            "date":                      date_str,
+            "system_id":                 system_id or "mock-system",
+            "total_production_wh":       total_wh,
+            "total_production_kwh":      round(total_wh / 1000, 2),
+            "hourly_readings":           readings,
+            "tou_schedule":              TOU_SCHEDULE,
+            "data_source":               data_source,
+            "home_battery_soc_pct":      battery_soc_pct,       # null when unknown
+            "home_battery_capacity_wh":  20000,                  # 4 × IQ Battery 5P
         }
 
         logger.info(
