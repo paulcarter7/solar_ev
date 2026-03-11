@@ -73,10 +73,13 @@ MOCK_HOURLY_SOLAR_WH = [
 # DynamoDB — fetch today's real per-hour solar production
 # ---------------------------------------------------------------------------
 
-def _get_hourly_solar_wh(table_name: str, system_id: str, date_str: str) -> tuple[list[int], str]:
+def _get_hourly_solar_wh(
+    table_name: str, system_id: str, date_str: str
+) -> tuple[list[int], str, int | None]:
     """
     Return a 24-slot list of per-Pacific-hour solar production (Wh) indexed
-    0–23 and a data_source string ("enphase" or "mock").
+    0–23, a data_source string ("enphase" or "mock"), and the most-recent
+    home battery SOC percentage (or None if unavailable).
 
     Queries both the requested UTC date and the next UTC date (a Pacific day
     crosses midnight UTC), then filters by summary_date to remove yesterday's
@@ -84,7 +87,7 @@ def _get_hourly_solar_wh(table_name: str, system_id: str, date_str: str) -> tupl
     are always correct across the Pacific-day boundary.
     """
     if not (table_name and system_id):
-        return list(MOCK_HOURLY_SOLAR_WH), "mock"
+        return list(MOCK_HOURLY_SOLAR_WH), "mock", None
 
     try:
         next_date = (date_cls.fromisoformat(date_str) + timedelta(days=1)).isoformat()
@@ -107,7 +110,7 @@ def _get_hourly_solar_wh(table_name: str, system_id: str, date_str: str) -> tupl
 
         if not items:
             logger.info("No DynamoDB rows for %s — recommendation using mock solar", date_str)
-            return list(MOCK_HOURLY_SOLAR_WH), "mock"
+            return list(MOCK_HOURLY_SOLAR_WH), "mock", None
 
         # Diff consecutive cumulative totals → per-snapshot production,
         # then accumulate by Pacific local hour
@@ -126,12 +129,24 @@ def _get_hourly_solar_wh(table_name: str, system_id: str, date_str: str) -> tupl
             prev = energy
 
         hourly = [by_local_hour.get(h, 0) for h in range(24)]
-        logger.info("Loaded %d snapshots for recommendation (%s)", len(items), date_str)
-        return hourly, "enphase"
+
+        # Most-recent item that includes a battery SOC reading
+        battery_soc_pct: int | None = None
+        for item in reversed(items):
+            if "battery_soc_pct" in item:
+                battery_soc_pct = int(item["battery_soc_pct"])
+                break
+
+        logger.info(
+            "Loaded %d snapshots for recommendation (%s), battery_soc=%s%%",
+            len(items), date_str,
+            battery_soc_pct if battery_soc_pct is not None else "n/a",
+        )
+        return hourly, "enphase", battery_soc_pct
 
     except Exception as exc:
         logger.warning("DynamoDB query failed for recommendation (%s) — using mock", exc)
-        return list(MOCK_HOURLY_SOLAR_WH), "mock"
+        return list(MOCK_HOURLY_SOLAR_WH), "mock", None
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +173,32 @@ def _score_window(start_hour: int, duration_hours: int, hourly_solar_wh: list[in
     }
 
 
+def _charging_source(
+    battery_soc_pct: int | None,
+    solar_coverage_pct: float,
+    rate_label: str,
+) -> tuple[str, str]:
+    """
+    Determine the recommended charging source based on home battery SOC and
+    the best window's solar coverage.
+
+    Returns (source_key, human_label) where source_key is one of:
+      "solar_direct"       — window covered mostly by solar, no grid needed
+      "solar_plus_battery" — solar + home battery can cover most of charging
+      "home_battery"       — use stored home battery to avoid peak grid rates
+      "grid"               — rely on cheapest available grid rate
+    """
+    if solar_coverage_pct >= 70:
+        if battery_soc_pct is not None and battery_soc_pct >= 60:
+            return "solar_plus_battery", "Solar + Home Battery"
+        return "solar_direct", "Direct Solar"
+    if battery_soc_pct is not None and battery_soc_pct >= 60 and rate_label == "peak":
+        return "home_battery", "Home Battery (avoid peak)"
+    if battery_soc_pct is not None and battery_soc_pct >= 80 and solar_coverage_pct >= 30:
+        return "solar_plus_battery", "Solar + Home Battery"
+    return "grid", f"Grid ({rate_label.title()})"
+
+
 # ---------------------------------------------------------------------------
 # Lambda entry point
 # ---------------------------------------------------------------------------
@@ -177,7 +218,7 @@ def lambda_handler(event: dict, context) -> dict:
         hours_needed = max(1, round(energy_needed_kwh / EV_CHARGE_RATE_KW))
 
         # Fetch real (or mock) solar production for scoring
-        hourly_solar_wh, data_source = _get_hourly_solar_wh(table_name, system_id, date_str)
+        hourly_solar_wh, data_source, battery_soc_pct = _get_hourly_solar_wh(table_name, system_id, date_str)
 
         # Score every valid start hour
         candidates = []
@@ -217,8 +258,9 @@ def lambda_handler(event: dict, context) -> dict:
                 f"({rate_label}, ~${best['estimated_cost_usd']:.2f}, "
                 f"{best['solar_coverage_pct']:.0f}% solar coverage)"
             ),
-            "all_candidates": candidates[:5],
-            "data_source":    data_source,
+            "all_candidates":      candidates[:5],
+            "data_source":         data_source,
+            "home_battery_soc_pct": battery_soc_pct,
         }
 
         logger.info(
