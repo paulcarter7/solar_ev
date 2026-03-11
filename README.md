@@ -186,6 +186,19 @@ aws ssm put-parameter --region $REGION --type SecureString \
 
 The ingest Lambda automatically refreshes the access token when it expires and writes the new token back to SSM — no manual rotation needed.
 
+### Curtailment alerts via ntfy.sh (optional)
+
+The ingest Lambda sends a push notification when the home battery is full and solar is being curtailed. To enable it:
+
+1. Pick a secret topic name (treat it like a password — anyone who knows it can subscribe):
+   ```bash
+   aws ssm put-parameter --region $REGION --type SecureString \
+     --name /solar-ev/ntfy-topic --value "your-secret-topic-name"
+   ```
+2. Install the [ntfy app](https://ntfy.sh/) on iOS or Android and subscribe to the same topic name.
+
+Alerts fire when: battery ≥ 95% **and** solar > 200 W **and** time is 09:00–17:00 Pacific. A 6-hour cooldown prevents repeated notifications. De-duplication state is stored in the `solar-ev-user-config` DynamoDB table.
+
 ### CDK bootstrap (one-time per account/region)
 ```bash
 cd infra
@@ -226,14 +239,16 @@ EventBridge (hourly)
         │
         ▼
   ingest Lambda
-  ┌──────────────────────────────┐
-  │ 1. Read credentials from SSM │
-  │ 2. GET /api/v4/systems/      │
-  │    {id}/summary  (Enphase)   │
-  │ 3. GET .../telemetry/battery │
-  │ 4. Write snapshot to DynamoDB│
-  │    with 90-day TTL           │
-  └──────────────────────────────┘
+  ┌──────────────────────────────────┐
+  │ 1. Read credentials from SSM     │
+  │ 2. GET /api/v4/systems/          │
+  │    {id}/summary  (Enphase)       │
+  │ 3. GET .../telemetry/battery     │
+  │ 4. Write snapshot to DynamoDB    │
+  │    with 90-day TTL               │
+  │ 5. If battery ≥ 95% + solar      │
+  │    curtailed → POST ntfy.sh alert│
+  └──────────────────────────────────┘
         │
         ▼
   DynamoDB: solar-ev-energy-readings
@@ -304,8 +319,7 @@ print(json.dumps(handler.lambda_handler({}, None), indent=2))
 | Feature | Where to start |
 |---------|---------------|
 | Weather-adjusted solar forecast | `backend/functions/ingest/handler.py` — add OpenWeatherMap fetch |
-| Wire up 3-way charging source decision | `backend/functions/recommendation/handler.py` — call `_charging_source()` |
 | Historical trend charts | Add date-range DynamoDB query to `solar_data`; new Recharts component |
 | User config (custom charge rate, schedule prefs) | `backend/functions/recommendation/handler.py` + `solar-ev-user-config` table |
-| Push notifications ("charge now!") | New Lambda + SNS topic |
+| EV charger scheduling | Enphase EVSE API requires a higher API tier; alternative: Home Assistant integration |
 | Host frontend on S3 + CloudFront | Add `S3Bucket` + `CloudFrontDistribution` to CDK stack |
