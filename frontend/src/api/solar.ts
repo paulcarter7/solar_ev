@@ -91,9 +91,10 @@ async function get<T>(path: string, params?: Record<string, string>): Promise<T>
 export const fetchSolarToday = (date?: string) =>
   get<SolarTodayResponse>("/solar/today", date ? { date } : undefined);
 
-export const fetchRecommendation = (params?: { current_soc?: number; target_soc?: number }) => {
+export const fetchRecommendation = (params?: { current_soc?: number; target_soc?: number; date?: string }) => {
   const qp: Record<string, string> = {};
   if (params?.current_soc !== undefined) qp.current_soc = String(params.current_soc);
   if (params?.target_soc !== undefined) qp.target_soc = String(params.target_soc);
+  if (params?.date !== undefined) qp.date = params.date;
   return get<RecommendationResponse>("/recommendation", Object.keys(qp).length ? qp : undefined);
 };

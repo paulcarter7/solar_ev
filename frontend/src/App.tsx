@@ -28,7 +28,7 @@ export default function App() {
     // Use the local date so the requested day matches the user's clock,
     // not UTC (which can be a day ahead after ~4 pm Pacific).
     const localToday = new Date().toLocaleDateString("en-CA"); // → YYYY-MM-DD
-    Promise.all([fetchSolarToday(localToday), fetchRecommendation({ current_soc: 0.3, target_soc: 0.8 })])
+    Promise.all([fetchSolarToday(localToday), fetchRecommendation({ current_soc: 0.3, target_soc: 0.8, date: localToday })])
       .then(([solar, recommendation]) => {
         setState({ solar, recommendation, status: "success", error: null });
       })
