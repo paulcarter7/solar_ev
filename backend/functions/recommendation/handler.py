@@ -226,6 +226,18 @@ def lambda_handler(event: dict, context) -> dict:
             if start + hours_needed > 24:
                 continue
             candidates.append(_score_window(start, hours_needed, hourly_solar_wh))
+
+        # Adjust scores based on home battery SOC
+        if battery_soc_pct is not None:
+            for c in candidates:
+                if c["solar_coverage_pct"] >= 30:
+                    if battery_soc_pct >= 80:
+                        # Battery full — solar charging even more attractive
+                        c["score"] *= 0.85
+                    elif battery_soc_pct <= 20:
+                        # Battery very low — let it charge first, de-prioritise solar windows
+                        c["score"] *= 1.15
+
         candidates.sort(key=lambda x: x["score"])
         best = candidates[0]
 
@@ -236,6 +248,10 @@ def lambda_handler(event: dict, context) -> dict:
             rate_label = "off-peak"
         else:
             rate_label = "peak"
+
+        source_key, source_label = _charging_source(
+            battery_soc_pct, best["solar_coverage_pct"], rate_label
+        )
 
         recommendation = {
             "date":               date_str,
@@ -258,9 +274,11 @@ def lambda_handler(event: dict, context) -> dict:
                 f"({rate_label}, ~${best['estimated_cost_usd']:.2f}, "
                 f"{best['solar_coverage_pct']:.0f}% solar coverage)"
             ),
-            "all_candidates":      candidates[:5],
-            "data_source":         data_source,
-            "home_battery_soc_pct": battery_soc_pct,
+            "all_candidates":        candidates[:5],
+            "data_source":           data_source,
+            "home_battery_soc_pct":  battery_soc_pct,
+            "charging_source":       source_key,
+            "charging_source_label": source_label,
         }
 
         logger.info(

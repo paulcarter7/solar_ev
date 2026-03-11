@@ -16,10 +16,12 @@ Environment variables:
   ENPHASE_REFRESH_TOKEN_PARAM    — /solar-ev/enphase-refresh-token
   ENPHASE_CLIENT_ID_PARAM        — /solar-ev/enphase-client-id
   ENPHASE_CLIENT_SECRET_PARAM    — /solar-ev/enphase-client-secret
+  NTFY_TOPIC_PARAM               — /solar-ev/ntfy-topic (curtailment alert topic)
 
   Local dev — set directly in backend/.env:
   ENPHASE_API_KEY, ENPHASE_ACCESS_TOKEN, ENPHASE_REFRESH_TOKEN,
   ENPHASE_CLIENT_ID, ENPHASE_CLIENT_SECRET
+  NTFY_TOPIC                     — ntfy.sh topic name (local dev only)
 """
 import base64
 import json
@@ -32,15 +34,20 @@ from urllib.request import Request, urlopen
 
 import boto3
 from botocore.exceptions import ClientError
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
+PACIFIC = ZoneInfo("America/Los_Angeles")
+
 # ---------------------------------------------------------------------------
 # AWS clients — created once per Lambda container
 # ---------------------------------------------------------------------------
-_ssm = boto3.client("ssm")
+_ssm    = boto3.client("ssm")
 _dynamo = boto3.resource("dynamodb")
+
+NTFY_BASE = "https://ntfy.sh"
 
 # SSM value cache — avoids repeat network calls on warm invocations
 _ssm_cache: dict[str, str] = {}
@@ -271,6 +278,123 @@ def _write_reading(table, system_id: str, summary: dict, battery_soc_pct: int | 
 
 
 # ---------------------------------------------------------------------------
+# Curtailment alert
+# ---------------------------------------------------------------------------
+
+# Alert conditions: battery nearly full + solar producing during daylight hours.
+# De-duplicated via DynamoDB so we don't spam more than once per 6 hours.
+_ALERT_BATTERY_THRESHOLD  = 95   # % SOC — battery considered "full enough"
+_ALERT_MIN_POWER_W        = 200  # W — must have some solar to trigger
+_ALERT_COOLDOWN_HOURS     = 6    # hours between repeated alerts
+_ALERT_DAYLIGHT_START     = 9    # Pacific local hour (inclusive)
+_ALERT_DAYLIGHT_END       = 17   # Pacific local hour (exclusive)
+_ALERT_USER_ID            = "default"
+_ALERT_CONFIG_KEY         = "curtailment_alert"
+
+
+def _should_send_curtailment_alert(
+    battery_soc_pct: int | None,
+    current_power_w: int,
+    config_table,
+) -> bool:
+    """
+    Return True when all three conditions are met:
+      1. Battery is at or near full capacity.
+      2. Solar is producing (system is curtailing to match home load).
+      3. We haven't already alerted in the last _ALERT_COOLDOWN_HOURS hours.
+    """
+    if battery_soc_pct is None or battery_soc_pct < _ALERT_BATTERY_THRESHOLD:
+        return False
+    if current_power_w < _ALERT_MIN_POWER_W:
+        return False
+
+    now_pacific = datetime.now(PACIFIC)
+    if not (_ALERT_DAYLIGHT_START <= now_pacific.hour < _ALERT_DAYLIGHT_END):
+        return False
+
+    # De-dup: check last alert timestamp in config table
+    try:
+        resp = config_table.get_item(
+            Key={"userId": _ALERT_USER_ID, "configType": _ALERT_CONFIG_KEY}
+        )
+        last_sent = resp.get("Item", {}).get("last_sent_at")
+        if last_sent:
+            last_dt = datetime.fromisoformat(last_sent)
+            if datetime.now(timezone.utc) - last_dt < timedelta(hours=_ALERT_COOLDOWN_HOURS):
+                logger.info(
+                    "Curtailment alert suppressed — last sent %s (cooldown %dh)",
+                    last_sent, _ALERT_COOLDOWN_HOURS,
+                )
+                return False
+    except Exception as exc:
+        logger.warning("Could not read alert de-dup record: %s", exc)
+
+    return True
+
+
+def _resolve_ntfy_topic() -> str | None:
+    """
+    Return the ntfy.sh topic name, or None if not configured.
+
+    Local dev  — NTFY_TOPIC env var (set in backend/.env).
+    Lambda     — fetched from SSM path in NTFY_TOPIC_PARAM env var.
+    """
+    direct = os.environ.get("NTFY_TOPIC", "")
+    if direct:
+        return direct
+    param_path = os.environ.get("NTFY_TOPIC_PARAM", "")
+    if param_path:
+        try:
+            return _get_ssm_param(param_path)
+        except Exception as exc:
+            logger.warning("Could not read ntfy topic from SSM: %s", exc)
+    return None
+
+
+def _send_curtailment_alert(
+    ntfy_topic: str,
+    battery_soc_pct: int,
+    current_power_w: int,
+    config_table,
+) -> None:
+    """POST a curtailment alert to ntfy.sh and record the timestamp in DynamoDB."""
+    message = (
+        f"Home battery at {battery_soc_pct}% (full). "
+        f"Solar producing {current_power_w} W but throttled to standby load — "
+        f"free energy going to waste. Plug in the BMW iX now."
+    )
+    try:
+        req = Request(
+            f"{NTFY_BASE}/{ntfy_topic}",
+            data=message.encode(),
+            headers={
+                "Title":    "Plug in your EV -- solar is being curtailed",
+                "Priority": "high",
+                "Tags":     "warning,electric_plug,sunny",
+            },
+            method="POST",
+        )
+        with urlopen(req, timeout=10) as resp:
+            logger.info(
+                "Curtailment alert sent via ntfy.sh: battery=%d%% power=%dW status=%s",
+                battery_soc_pct, current_power_w, resp.status,
+            )
+    except Exception as exc:
+        logger.error("ntfy.sh publish failed: %s", exc)
+        return
+
+    # Record send time so we don't spam
+    try:
+        config_table.put_item(Item={
+            "userId":       _ALERT_USER_ID,
+            "configType":   _ALERT_CONFIG_KEY,
+            "last_sent_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as exc:
+        logger.warning("Could not write alert de-dup record: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Lambda entry point
 # ---------------------------------------------------------------------------
 
@@ -297,6 +421,16 @@ def lambda_handler(event: dict, context) -> dict:
         battery_soc_pct = _fetch_battery_soc(system_id, api_key, access_token)
         table = _dynamo.Table(table_name)
         _write_reading(table, system_id, summary, battery_soc_pct=battery_soc_pct)
+
+        # Alert if battery full and solar is being curtailed
+        ntfy_topic   = _resolve_ntfy_topic()
+        config_table = _dynamo.Table(os.environ.get("CONFIG_TABLE", ""))
+        if ntfy_topic and _should_send_curtailment_alert(
+            battery_soc_pct, summary.get("current_power", 0), config_table
+        ):
+            _send_curtailment_alert(
+                ntfy_topic, battery_soc_pct, summary.get("current_power", 0), config_table
+            )
     except Exception as exc:
         logger.exception("Enphase ingest failed: %s", exc)
         return {

@@ -97,6 +97,11 @@ export class SolarEvStack extends cdk.Stack {
     // SSM parameter paths for secrets — values stored via:
     //   aws ssm put-parameter --name /solar-ev/enphase-api-key \
     //     --value "YOUR_KEY" --type SecureString
+    //
+    // Curtailment alerts via ntfy.sh — store your topic name:
+    //   aws ssm put-parameter --name /solar-ev/ntfy-topic \
+    //     --value "your-secret-topic" --type SecureString
+    //   Then subscribe in the ntfy app to that topic name.
     const SSM_PREFIX = "/solar-ev";
 
     const ingestFn = new lambda.Function(this, "IngestFn", {
@@ -119,6 +124,7 @@ export class SolarEvStack extends cdk.Stack {
         ENPHASE_CLIENT_ID_PARAM:     `${SSM_PREFIX}/enphase-client-id`,
         ENPHASE_CLIENT_SECRET_PARAM: `${SSM_PREFIX}/enphase-client-secret`,
         OPENWEATHER_API_KEY_PARAM:   `${SSM_PREFIX}/openweather-api-key`,
+        NTFY_TOPIC_PARAM:            `${SSM_PREFIX}/ntfy-topic`,
       },
       timeout: cdk.Duration.seconds(60),
       memorySize: 256,
@@ -127,8 +133,10 @@ export class SolarEvStack extends cdk.Stack {
     });
 
     energyTable.grantReadWriteData(ingestFn);
+    // Ingest writes de-dup records to config table to prevent alert spam
+    configTable.grantReadWriteData(ingestFn);
 
-    // Allow ingest Lambda to read all /solar-ev/* params
+    // Allow ingest Lambda to read all /solar-ev/* params (covers ntfy-topic too)
     ingestFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["ssm:GetParameter"],

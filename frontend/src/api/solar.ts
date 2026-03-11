@@ -35,6 +35,8 @@ export interface SolarTodayResponse {
   hourly_readings: HourlyReading[];
   tou_schedule: TouPeriod[];
   data_source: "enphase" | "mock";
+  home_battery_soc_pct: number | null;
+  home_battery_capacity_wh: number;
 }
 
 export interface ChargingWindow {
@@ -65,6 +67,9 @@ export interface RecommendationResponse {
     score: number;
   }>;
   data_source: "enphase" | "mock";
+  home_battery_soc_pct: number | null;
+  charging_source: string;
+  charging_source_label: string;
 }
 
 // ---------------------------------------------------------------------------

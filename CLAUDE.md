@@ -5,10 +5,19 @@ A personal app for monitoring and optimizing home energy — solar production,
 EV charging, and grid consumption. Built as a learning project for AWS
 serverless and React.
 
+## Hardware
+- **Solar**: 15 × Enphase IQ8AC microinverters, 6.6 kW system
+- **Home battery**: 4 × Enphase IQ Battery 5P = 20 kWh, max 14.16 kW charge/discharge
+- **EV**: 2026 BMW iX 45 — 76.6 kWh usable, 7.2–11 kW AC charging
+- **EV charger**: Enphase IQ EVSE 50R (serial 482535021339, 1.44–9.6 kW range), managed by Enphase app
+- **Utility**: PG&E / MCE, rate plan E-TOU-C
+
 ## Stack
-- **Backend**: AWS Lambda (Python), DynamoDB, EventBridge
-- **Frontend**: React
-- **Infrastructure**: AWS serverless — no EC2, no always-on servers
+- **Backend**: AWS Lambda (Python 3.12), DynamoDB, EventBridge (hourly cron)
+- **Frontend**: React 18 + Vite + Tailwind 3 + Recharts
+- **Infrastructure**: AWS CDK (TypeScript) — no EC2, no always-on servers
+- **Enphase API**: Enlighten v4 (`https://api.enphaseenergy.com/api/v4`)
+  — credentials in SSM Parameter Store (api-key, access-token, client-id, client-secret)
 
 ## Architecture Rules
 - Lambda functions stay small and single-purpose — one responsibility per function

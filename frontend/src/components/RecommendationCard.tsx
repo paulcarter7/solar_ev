@@ -10,9 +10,20 @@ const RATE_COLOR: Record<string, string> = {
   "peak": "text-red-400",
 };
 
+const SOURCE_STYLE: Record<string, string> = {
+  solar_direct:       "bg-green-900 text-green-300 border-green-700",
+  solar_plus_battery: "bg-teal-900 text-teal-300 border-teal-700",
+  home_battery:       "bg-blue-900 text-blue-300 border-blue-700",
+  grid:               "bg-gray-700 text-gray-300 border-gray-600",
+};
+
 export function RecommendationCard({ data }: Props) {
-  const { best_window, energy_needed_kwh, current_soc_pct, target_soc_pct, ev_model } = data;
+  const {
+    best_window, energy_needed_kwh, current_soc_pct, target_soc_pct, ev_model,
+    home_battery_soc_pct, charging_source, charging_source_label,
+  } = data;
   const rateColor = RATE_COLOR[best_window.rate_period] ?? "text-gray-300";
+  const sourceBadge = SOURCE_STYLE[charging_source] ?? SOURCE_STYLE.grid;
 
   return (
     <div className="rounded-2xl bg-gray-800 border border-gray-700 p-5 space-y-4">
@@ -22,7 +33,11 @@ export function RecommendationCard({ data }: Props) {
           <p className="text-xs text-gray-500 uppercase tracking-wider">EV Charging Recommendation</p>
           <p className="text-sm text-gray-400 mt-0.5">{ev_model}</p>
         </div>
-        <span className="text-2xl">⚡</span>
+        <span
+          className={`text-xs font-medium px-2 py-1 rounded-full border ${sourceBadge}`}
+        >
+          {charging_source_label}
+        </span>
       </div>
 
       {/* Best window */}
@@ -47,10 +62,10 @@ export function RecommendationCard({ data }: Props) {
         <Stat label="Energy Needed" value={`${energy_needed_kwh.toFixed(1)} kWh`} />
       </div>
 
-      {/* SOC bar */}
+      {/* EV SOC bar */}
       <div className="space-y-1">
         <div className="flex justify-between text-xs text-gray-500">
-          <span>Current: {current_soc_pct}%</span>
+          <span>EV battery: {current_soc_pct}%</span>
           <span>Target: {target_soc_pct}%</span>
         </div>
         <div className="relative h-2.5 rounded-full bg-gray-700 overflow-hidden">
@@ -64,6 +79,22 @@ export function RecommendationCard({ data }: Props) {
           />
         </div>
       </div>
+
+      {/* Home battery SOC bar */}
+      {home_battery_soc_pct !== null && home_battery_soc_pct !== undefined && (
+        <div className="space-y-1">
+          <div className="flex justify-between text-xs text-gray-500">
+            <span>Home battery: {home_battery_soc_pct}%</span>
+            <span>20 kWh</span>
+          </div>
+          <div className="relative h-2.5 rounded-full bg-gray-700 overflow-hidden">
+            <div
+              className="absolute left-0 top-0 h-full bg-teal-500 rounded-full"
+              style={{ width: `${home_battery_soc_pct}%` }}
+            />
+          </div>
+        </div>
+      )}
 
       {data.data_source === "mock" && (
         <p className="text-xs text-gray-600 italic">
