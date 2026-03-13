@@ -8,12 +8,24 @@
     "cdk": "cdk",
     "deploy": "cdk deploy --require-approval never",
     "diff": "cdk diff",
-    "synth": "cdk synth"
+    "synth": "cdk synth",
+    "test": "jest"
   },
   "devDependencies": {
+    "@types/jest": "^29.5.14",
     "@types/node": "22.x",
     "aws-cdk": "2.x",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.4.6",
     "typescript": "~5.7"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "roots": ["<rootDir>/test"],
+    "testMatch": ["**/*.test.ts"],
+    "transform": {
+      "^.+\\.tsx?$": "ts-jest"
+    }
   },
   "dependencies": {
     "aws-cdk-lib": "2.x",

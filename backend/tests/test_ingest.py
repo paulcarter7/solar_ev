@@ -237,5 +237,419 @@ class TestIngestLambdaHandler(unittest.TestCase):
         self.assertEqual(int(items[0]["battery_soc_pct"]), 80)
 
 
+CONFIG_TABLE_NAME = "test-user-config"
+
+
+def _make_config_table(ddb):
+    return ddb.create_table(
+        TableName=CONFIG_TABLE_NAME,
+        KeySchema=[
+            {"AttributeName": "userId",     "KeyType": "HASH"},
+            {"AttributeName": "configType", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "userId",     "AttributeType": "S"},
+            {"AttributeName": "configType", "AttributeType": "S"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+
+# ---------------------------------------------------------------------------
+# _get_ssm_param / _put_ssm_param
+# ---------------------------------------------------------------------------
+
+@mock_aws
+class TestSsmHelpers(unittest.TestCase):
+    """SSM read/write helpers hit moto and populate the in-process cache."""
+
+    def setUp(self):
+        # Clear the module-level cache before every test
+        ingest._ssm_cache.clear()
+        self.ssm = boto3.client("ssm", region_name="us-east-1")
+        ingest._ssm = self.ssm
+        self.ssm.put_parameter(
+            Name="/test/param",
+            Value="secret-value",
+            Type="SecureString",
+        )
+
+    def tearDown(self):
+        ingest._ssm_cache.clear()
+
+    def test_get_ssm_param_returns_value(self):
+        val = ingest._get_ssm_param("/test/param")
+        self.assertEqual(val, "secret-value")
+
+    def test_get_ssm_param_caches_result(self):
+        ingest._get_ssm_param("/test/param")
+        # Overwrite in SSM — cached value should still be returned
+        self.ssm.put_parameter(Name="/test/param", Value="updated", Type="SecureString", Overwrite=True)
+        self.assertEqual(ingest._get_ssm_param("/test/param"), "secret-value")
+
+    def test_get_ssm_param_raises_on_missing(self):
+        from botocore.exceptions import ClientError
+        with self.assertRaises(ClientError):
+            ingest._get_ssm_param("/does/not/exist")
+
+    def test_put_ssm_param_overwrites_value(self):
+        ingest._put_ssm_param("/test/param", "new-value")
+        resp = self.ssm.get_parameter(Name="/test/param", WithDecryption=True)
+        self.assertEqual(resp["Parameter"]["Value"], "new-value")
+
+    def test_put_ssm_param_updates_cache(self):
+        ingest._put_ssm_param("/test/param", "cached-new")
+        # Cache should reflect the new value without another SSM call
+        self.assertEqual(ingest._ssm_cache["/test/param"], "cached-new")
+
+
+# ---------------------------------------------------------------------------
+# _resolve_credentials
+# ---------------------------------------------------------------------------
+
+class TestResolveCredentials(unittest.TestCase):
+    """_resolve_credentials returns (api_key, access_token, client_id, client_secret)."""
+
+    def _clear_env(self):
+        for key in (
+            "ENPHASE_API_KEY", "ENPHASE_ACCESS_TOKEN",
+            "ENPHASE_CLIENT_ID", "ENPHASE_CLIENT_SECRET",
+            "ENPHASE_API_KEY_PARAM", "ENPHASE_ACCESS_TOKEN_PARAM",
+            "ENPHASE_CLIENT_ID_PARAM", "ENPHASE_CLIENT_SECRET_PARAM",
+        ):
+            os.environ.pop(key, None)
+
+    def setUp(self):
+        self._clear_env()
+
+    def tearDown(self):
+        self._clear_env()
+
+    def test_returns_env_credentials_when_all_set(self):
+        os.environ["ENPHASE_API_KEY"]       = "k"
+        os.environ["ENPHASE_ACCESS_TOKEN"]  = "t"
+        os.environ["ENPHASE_CLIENT_ID"]     = "id"
+        os.environ["ENPHASE_CLIENT_SECRET"] = "sec"
+        result = ingest._resolve_credentials()
+        self.assertEqual(result, ("k", "t", "id", "sec"))
+
+    def test_falls_through_to_ssm_when_env_missing(self):
+        # No direct env vars set — SSM path vars are also missing → KeyError
+        with self.assertRaises(KeyError):
+            ingest._resolve_credentials()
+
+    def test_falls_through_to_ssm_when_value_is_mock(self):
+        # "mock" sentinel triggers the SSM path; no PARAM vars → KeyError
+        os.environ["ENPHASE_API_KEY"]       = "mock"
+        os.environ["ENPHASE_ACCESS_TOKEN"]  = "mock"
+        os.environ["ENPHASE_CLIENT_ID"]     = "mock"
+        os.environ["ENPHASE_CLIENT_SECRET"] = "mock"
+        with self.assertRaises(KeyError):
+            ingest._resolve_credentials()
+
+    @mock_aws
+    def test_reads_from_ssm_when_param_vars_set(self):
+        ssm = boto3.client("ssm", region_name="us-east-1")
+        ingest._ssm = ssm
+        ingest._ssm_cache.clear()
+        for name, val in [
+            ("/p/key", "api-key"), ("/p/tok", "access-tok"),
+            ("/p/id",  "cli-id"), ("/p/sec", "cli-sec"),
+        ]:
+            ssm.put_parameter(Name=name, Value=val, Type="SecureString")
+
+        os.environ["ENPHASE_API_KEY_PARAM"]       = "/p/key"
+        os.environ["ENPHASE_ACCESS_TOKEN_PARAM"]  = "/p/tok"
+        os.environ["ENPHASE_CLIENT_ID_PARAM"]     = "/p/id"
+        os.environ["ENPHASE_CLIENT_SECRET_PARAM"] = "/p/sec"
+
+        result = ingest._resolve_credentials()
+        self.assertEqual(result, ("api-key", "access-tok", "cli-id", "cli-sec"))
+
+        for key in ("ENPHASE_API_KEY_PARAM", "ENPHASE_ACCESS_TOKEN_PARAM",
+                    "ENPHASE_CLIENT_ID_PARAM", "ENPHASE_CLIENT_SECRET_PARAM"):
+            os.environ.pop(key, None)
+        ingest._ssm_cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# _refresh_tokens
+# ---------------------------------------------------------------------------
+
+class TestRefreshTokens(unittest.TestCase):
+    """_refresh_tokens exchanges refresh_token for new access/refresh tokens."""
+
+    def setUp(self):
+        for k in ("ENPHASE_REFRESH_TOKEN", "ENPHASE_ACCESS_TOKEN",
+                  "ENPHASE_REFRESH_TOKEN_PARAM", "ENPHASE_ACCESS_TOKEN_PARAM"):
+            os.environ.pop(k, None)
+        ingest._ssm_cache.clear()
+
+    def tearDown(self):
+        for k in ("ENPHASE_REFRESH_TOKEN", "ENPHASE_ACCESS_TOKEN",
+                  "ENPHASE_REFRESH_TOKEN_PARAM", "ENPHASE_ACCESS_TOKEN_PARAM"):
+            os.environ.pop(k, None)
+        ingest._ssm_cache.clear()
+
+    def _fake_token_response(self, access="new-access", refresh="new-refresh"):
+        payload = json.dumps({"access_token": access, "refresh_token": refresh}).encode()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = payload
+        return mock_resp
+
+    def test_local_dev_path_updates_env(self):
+        os.environ["ENPHASE_REFRESH_TOKEN"] = "old-refresh"
+        with patch("ingest_handler.urlopen", return_value=self._fake_token_response()):
+            result = ingest._refresh_tokens("client-id", "client-secret")
+        self.assertEqual(result, "new-access")
+        self.assertEqual(os.environ["ENPHASE_ACCESS_TOKEN"], "new-access")
+        self.assertEqual(os.environ["ENPHASE_REFRESH_TOKEN"], "new-refresh")
+
+    @mock_aws
+    def test_lambda_path_updates_ssm(self):
+        ssm = boto3.client("ssm", region_name="us-east-1")
+        ingest._ssm = ssm
+        ssm.put_parameter(Name="/p/refresh", Value="old-refresh", Type="SecureString")
+        ssm.put_parameter(Name="/p/access", Value="old-access", Type="SecureString")
+        ingest._ssm_cache["/p/refresh"] = "old-refresh"
+
+        os.environ["ENPHASE_REFRESH_TOKEN_PARAM"] = "/p/refresh"
+        os.environ["ENPHASE_ACCESS_TOKEN_PARAM"]  = "/p/access"
+
+        with patch("ingest_handler.urlopen", return_value=self._fake_token_response()):
+            result = ingest._refresh_tokens("client-id", "client-secret")
+
+        self.assertEqual(result, "new-access")
+        resp = ssm.get_parameter(Name="/p/access", WithDecryption=True)
+        self.assertEqual(resp["Parameter"]["Value"], "new-access")
+
+    def test_raises_when_no_refresh_token(self):
+        with self.assertRaises(ValueError, msg="No refresh token available"):
+            ingest._refresh_tokens("cid", "csec")
+
+
+# ---------------------------------------------------------------------------
+# _fetch_enphase_summary
+# ---------------------------------------------------------------------------
+
+class TestFetchEnphaseSummary(unittest.TestCase):
+    """_fetch_enphase_summary GETs /summary and handles 401 with token refresh."""
+
+    def _fake_response(self, payload):
+        body = json.dumps(payload).encode()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = body
+        return mock_resp
+
+    def test_success_returns_summary_dict(self):
+        summary = {"current_power": 3000, "energy_today": 12000, "summary_date": "2026-03-11"}
+        with patch("ingest_handler.urlopen", return_value=self._fake_response(summary)):
+            result = ingest._fetch_enphase_summary("sys-1", "key", "tok", "cid", "csec")
+        self.assertEqual(result["current_power"], 3000)
+        self.assertEqual(result["energy_today"], 12000)
+
+    def test_401_triggers_token_refresh_and_retry(self):
+        from urllib.error import HTTPError
+        summary = {"current_power": 1000, "energy_today": 5000, "summary_date": "2026-03-11"}
+
+        call_count = {"n": 0}
+
+        def fake_urlopen(req, timeout=None):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise HTTPError(url="", code=401, msg="Unauthorized", hdrs=None, fp=None)
+            return self._fake_response(summary)
+
+        with patch("ingest_handler.urlopen", side_effect=fake_urlopen), \
+             patch("ingest_handler._refresh_tokens", return_value="new-tok") as mock_refresh:
+            result = ingest._fetch_enphase_summary("sys-1", "key", "tok", "cid", "csec")
+
+        mock_refresh.assert_called_once_with("cid", "csec")
+        self.assertEqual(result["current_power"], 1000)
+
+    def test_non_401_http_error_propagates(self):
+        from urllib.error import HTTPError
+        err = HTTPError(url="", code=500, msg="Server Error", hdrs=None, fp=MagicMock(read=lambda: b"oops"))
+        with patch("ingest_handler.urlopen", side_effect=err):
+            with self.assertRaises(HTTPError):
+                ingest._fetch_enphase_summary("sys-1", "key", "tok", "cid", "csec")
+
+    def test_url_error_propagates(self):
+        from urllib.error import URLError
+        with patch("ingest_handler.urlopen", side_effect=URLError("timeout")):
+            with self.assertRaises(URLError):
+                ingest._fetch_enphase_summary("sys-1", "key", "tok", "cid", "csec")
+
+
+# ---------------------------------------------------------------------------
+# _should_send_curtailment_alert
+# ---------------------------------------------------------------------------
+
+@mock_aws
+class TestShouldSendCurtailmentAlert(unittest.TestCase):
+    """_should_send_curtailment_alert applies battery/power/time/cooldown logic."""
+
+    # Shared fake "now" — both variants must agree so cooldown arithmetic is self-consistent
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo as _ZI
+    _FAKE_PAC = datetime(2026, 3, 11, 11, 0, tzinfo=_ZI("America/Los_Angeles"))
+    _FAKE_UTC = _FAKE_PAC.astimezone(timezone.utc)
+
+    def setUp(self):
+        ddb = boto3.resource("dynamodb", region_name="us-east-1")
+        ingest._dynamo = ddb
+        self.config_table = _make_config_table(ddb)
+
+    def _call(self, soc, power_w, hour=11):
+        """Call with a fixed Pacific hour; both now(PACIFIC) and now(UTC) use the same instant."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        pacific = ZoneInfo("America/Los_Angeles")
+        fake_pac = datetime(2026, 3, 11, hour, 0, tzinfo=pacific)
+        fake_utc = fake_pac.astimezone(__import__("datetime").timezone.utc)
+
+        def fake_now(tz=None):
+            if tz is not None and getattr(tz, "key", None) == "America/Los_Angeles":
+                return fake_pac
+            return fake_utc
+
+        with patch("ingest_handler.datetime") as mock_dt:
+            mock_dt.now.side_effect = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            return ingest._should_send_curtailment_alert(soc, power_w, self.config_table)
+
+    def test_returns_true_when_all_conditions_met(self):
+        self.assertTrue(self._call(soc=96, power_w=500, hour=11))
+
+    def test_returns_false_when_soc_below_threshold(self):
+        self.assertFalse(self._call(soc=90, power_w=500, hour=11))
+
+    def test_returns_false_when_soc_is_none(self):
+        self.assertFalse(self._call(soc=None, power_w=500, hour=11))
+
+    def test_returns_false_when_power_too_low(self):
+        self.assertFalse(self._call(soc=96, power_w=100, hour=11))
+
+    def test_returns_false_outside_daylight_hours(self):
+        self.assertFalse(self._call(soc=96, power_w=500, hour=20))
+
+    def test_returns_false_within_cooldown(self):
+        from datetime import timedelta
+        # 2 hours before _FAKE_UTC — still within the 6-hour cooldown window
+        recent = (self._FAKE_UTC - timedelta(hours=2)).isoformat()
+        self.config_table.put_item(Item={
+            "userId":       "default",
+            "configType":   "curtailment_alert",
+            "last_sent_at": recent,
+        })
+        self.assertFalse(self._call(soc=96, power_w=500, hour=11))
+
+    def test_returns_true_when_cooldown_expired(self):
+        from datetime import timedelta
+        # 8 hours before _FAKE_UTC — past the 6-hour cooldown window
+        old = (self._FAKE_UTC - timedelta(hours=8)).isoformat()
+        self.config_table.put_item(Item={
+            "userId":       "default",
+            "configType":   "curtailment_alert",
+            "last_sent_at": old,
+        })
+        self.assertTrue(self._call(soc=96, power_w=500, hour=11))
+
+
+# ---------------------------------------------------------------------------
+# _resolve_ntfy_topic
+# ---------------------------------------------------------------------------
+
+class TestResolveNtfyTopic(unittest.TestCase):
+    """_resolve_ntfy_topic returns the topic from env or SSM, or None."""
+
+    def setUp(self):
+        os.environ.pop("NTFY_TOPIC", None)
+        os.environ.pop("NTFY_TOPIC_PARAM", None)
+        ingest._ssm_cache.clear()
+
+    def tearDown(self):
+        os.environ.pop("NTFY_TOPIC", None)
+        os.environ.pop("NTFY_TOPIC_PARAM", None)
+        ingest._ssm_cache.clear()
+
+    def test_returns_direct_env_topic(self):
+        os.environ["NTFY_TOPIC"] = "my-topic"
+        self.assertEqual(ingest._resolve_ntfy_topic(), "my-topic")
+
+    @mock_aws
+    def test_fetches_from_ssm_when_param_set(self):
+        ssm = boto3.client("ssm", region_name="us-east-1")
+        ingest._ssm = ssm
+        ssm.put_parameter(Name="/p/ntfy", Value="ssm-topic", Type="SecureString")
+        os.environ["NTFY_TOPIC_PARAM"] = "/p/ntfy"
+        self.assertEqual(ingest._resolve_ntfy_topic(), "ssm-topic")
+
+    def test_returns_none_when_neither_set(self):
+        self.assertIsNone(ingest._resolve_ntfy_topic())
+
+    @mock_aws
+    def test_returns_none_when_ssm_param_missing(self):
+        ssm = boto3.client("ssm", region_name="us-east-1")
+        ingest._ssm = ssm
+        ingest._ssm_cache.clear()
+        os.environ["NTFY_TOPIC_PARAM"] = "/does/not/exist"
+        self.assertIsNone(ingest._resolve_ntfy_topic())
+
+
+# ---------------------------------------------------------------------------
+# _send_curtailment_alert
+# ---------------------------------------------------------------------------
+
+@mock_aws
+class TestSendCurtailmentAlert(unittest.TestCase):
+    """_send_curtailment_alert POSTs to ntfy.sh and records send time in DynamoDB."""
+
+    def setUp(self):
+        ddb = boto3.resource("dynamodb", region_name="us-east-1")
+        ingest._dynamo = ddb
+        self.config_table = _make_config_table(ddb)
+
+    def _fake_ntfy_response(self, status=200):
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.status = status
+        return mock_resp
+
+    def test_posts_to_ntfy_and_records_timestamp(self):
+        with patch("ingest_handler.urlopen", return_value=self._fake_ntfy_response()):
+            ingest._send_curtailment_alert("my-topic", 96, 800, self.config_table)
+
+        item = self.config_table.get_item(
+            Key={"userId": "default", "configType": "curtailment_alert"}
+        ).get("Item")
+        self.assertIsNotNone(item)
+        self.assertIn("last_sent_at", item)
+
+    def test_send_failure_does_not_raise(self):
+        """Network failure should be swallowed (logged only)."""
+        with patch("ingest_handler.urlopen", side_effect=Exception("network error")):
+            # Should not raise
+            ingest._send_curtailment_alert("my-topic", 96, 800, self.config_table)
+
+    def test_message_contains_soc_and_power(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["data"] = req.data.decode()
+            return self._fake_ntfy_response()
+
+        with patch("ingest_handler.urlopen", side_effect=fake_urlopen):
+            ingest._send_curtailment_alert("my-topic", 97, 1200, self.config_table)
+
+        self.assertIn("97%", captured["data"])
+        self.assertIn("1200 W", captured["data"])
+
+
 if __name__ == "__main__":
     unittest.main()

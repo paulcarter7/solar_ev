@@ -143,13 +143,37 @@ The local server loads this file automatically at startup. When `ENPHASE_SYSTEM_
 
 ## 3. Run the tests
 
+### Backend (Python — pytest + moto)
+
 ```bash
 cd backend
 source .venv/bin/activate   # if not already active
 pytest tests/ -v
 ```
 
-Tests use `moto` to mock DynamoDB — no AWS credentials or live calls needed.
+All AWS calls are mocked with `moto` — no credentials or live infrastructure needed.
+
+Covered: `solar_data`, `recommendation`, and `ingest` Lambda handlers (including SSM helpers, OAuth token refresh, Enphase API calls, curtailment alert logic) plus shared utilities.
+
+### Frontend (TypeScript — Vitest + Testing Library)
+
+```bash
+cd frontend
+npm test              # run all tests once
+npm run test:watch    # watch mode
+npm run test:coverage # with coverage report
+```
+
+Covered: API client (`fetchSolarToday`, `fetchRecommendation`), pure chart/timeline functions (`timeToHour`, `rateAtHour`, `hourToPercent`), `RecommendationCard` component, and `App` integration (loading, success, error states).
+
+### Infrastructure (TypeScript — Jest + CDK Assertions)
+
+```bash
+cd infra
+npm test
+```
+
+Covered: DynamoDB table schema and TTL, Lambda function names/runtimes/env vars/timeouts, IAM policies (SSM GetParameter/PutParameter scopes), API Gateway routes, and EventBridge schedule.
 
 ---
 
@@ -296,11 +320,21 @@ npm run dev            # local dev server (http://localhost:5173)
 npm run build          # production build → dist/
 npm run typecheck      # TypeScript check without building
 
-# Backend tests
+# Backend tests (pytest + moto)
 cd backend
 pytest tests/ -v                     # all tests
 pytest tests/test_recommendation.py  # single file
 pytest tests/ --cov=functions        # with coverage
+
+# Frontend tests (Vitest + Testing Library)
+cd frontend
+npm test                             # run once
+npm run test:watch                   # watch mode
+npm run test:coverage                # with coverage
+
+# CDK infrastructure tests (Jest + CDK Assertions)
+cd infra
+npm test
 
 # Quick Lambda smoke test (no server needed)
 cd backend
