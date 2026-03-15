@@ -4,11 +4,15 @@ Triggered hourly by EventBridge.
 
 Fetches live solar production data from the Enphase Enlighten v4 API and
 writes a snapshot reading to DynamoDB. Automatically refreshes OAuth tokens
-when they expire and persists the new tokens back to SSM.
+when they expire and persists the new tokens back to SSM. Also fetches
+current weather conditions from OpenWeatherMap (free tier) and includes
+cloud cover, temperature, and weather condition in each DynamoDB snapshot.
 
 Environment variables:
   ENPHASE_SYSTEM_ID              — system ID (non-sensitive, plain env var)
   ENERGY_TABLE                   — DynamoDB table name
+  LOCATION_LAT                   — latitude for weather lookup (e.g. "37.8216")
+  LOCATION_LON                   — longitude for weather lookup (e.g. "-121.9999")
 
   Lambda — SSM paths (fetched + decrypted at runtime):
   ENPHASE_API_KEY_PARAM          — /solar-ev/enphase-api-key
@@ -17,11 +21,13 @@ Environment variables:
   ENPHASE_CLIENT_ID_PARAM        — /solar-ev/enphase-client-id
   ENPHASE_CLIENT_SECRET_PARAM    — /solar-ev/enphase-client-secret
   NTFY_TOPIC_PARAM               — /solar-ev/ntfy-topic (curtailment alert topic)
+  OPENWEATHER_API_KEY_PARAM      — /solar-ev/openweather-api-key
 
   Local dev — set directly in backend/.env:
   ENPHASE_API_KEY, ENPHASE_ACCESS_TOKEN, ENPHASE_REFRESH_TOKEN,
   ENPHASE_CLIENT_ID, ENPHASE_CLIENT_SECRET
   NTFY_TOPIC                     — ntfy.sh topic name (local dev only)
+  OPENWEATHER_API_KEY            — OWM API key (local dev only)
 """
 import base64
 import json
@@ -48,6 +54,7 @@ _ssm    = boto3.client("ssm")
 _dynamo = boto3.resource("dynamodb")
 
 NTFY_BASE = "https://ntfy.sh"
+OWM_BASE  = "https://api.openweathermap.org/data/2.5"
 
 # SSM value cache — avoids repeat network calls on warm invocations
 _ssm_cache: dict[str, str] = {}
@@ -243,10 +250,71 @@ def _fetch_battery_soc(system_id: str, api_key: str, access_token: str) -> int |
 
 
 # ---------------------------------------------------------------------------
+# Weather (OpenWeatherMap)
+# ---------------------------------------------------------------------------
+
+def _resolve_owm_api_key() -> str | None:
+    """
+    Return the OWM API key, or None if not configured.
+
+    Local dev  — OPENWEATHER_API_KEY env var (set in backend/.env).
+    Lambda     — fetched from SSM path in OPENWEATHER_API_KEY_PARAM env var.
+    """
+    direct = os.environ.get("OPENWEATHER_API_KEY", "")
+    if direct:
+        return direct
+    param_path = os.environ.get("OPENWEATHER_API_KEY_PARAM", "")
+    if param_path:
+        try:
+            return _get_ssm_param(param_path)
+        except Exception as exc:
+            logger.warning("Could not read OWM API key from SSM: %s", exc)
+    return None
+
+
+def _fetch_weather(lat: str, lon: str, api_key: str) -> dict | None:
+    """
+    Fetch current weather from OWM and return cloud cover, temperature, and
+    condition string, or None on any failure (non-fatal).
+    """
+    try:
+        url = (
+            f"{OWM_BASE}/weather"
+            f"?lat={lat}&lon={lon}&appid={api_key}&units=metric"
+        )
+        req = Request(url, headers={"Accept": "application/json"})
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+
+        cloud_cover_pct   = data["clouds"]["all"]
+        temp_c            = round(data["main"]["temp"])
+        weather_condition = data["weather"][0]["main"]
+
+        logger.info(
+            "Weather: %s, %d°C, cloud cover %d%%",
+            weather_condition, temp_c, cloud_cover_pct,
+        )
+        return {
+            "cloud_cover_pct":   cloud_cover_pct,
+            "temp_c":            temp_c,
+            "weather_condition": weather_condition,
+        }
+    except Exception as exc:
+        logger.warning("Weather fetch failed (%s) — skipping", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # DynamoDB
 # ---------------------------------------------------------------------------
 
-def _write_reading(table, system_id: str, summary: dict, battery_soc_pct: int | None = None) -> None:
+def _write_reading(
+    table,
+    system_id: str,
+    summary: dict,
+    battery_soc_pct: int | None = None,
+    weather: dict | None = None,
+) -> None:
     """Write one snapshot row to DynamoDB with a 90-day TTL."""
     now = datetime.now(timezone.utc)
     ttl = int((now + timedelta(days=90)).timestamp())
@@ -269,11 +337,17 @@ def _write_reading(table, system_id: str, summary: dict, battery_soc_pct: int | 
     }
     if battery_soc_pct is not None:
         item["battery_soc_pct"] = battery_soc_pct
+    if weather is not None:
+        item["cloud_cover_pct"]   = weather["cloud_cover_pct"]
+        item["temp_c"]            = weather["temp_c"]
+        item["weather_condition"] = weather["weather_condition"]
     table.put_item(Item=item)
     logger.info(
-        "Wrote reading: deviceId=%s timestamp=%s energy_wh=%s power_w=%s battery_soc=%s%%",
+        "Wrote reading: deviceId=%s timestamp=%s energy_wh=%s power_w=%s "
+        "battery_soc=%s%% weather=%s",
         item["deviceId"], ts, item["energy_wh"], item["power_w"],
         battery_soc_pct if battery_soc_pct is not None else "n/a",
+        weather.get("weather_condition") if weather else "n/a",
     )
 
 
@@ -417,10 +491,16 @@ def lambda_handler(event: dict, context) -> dict:
         summary = _fetch_enphase_summary(
             system_id, api_key, access_token, client_id, client_secret
         )
-        # Fetch battery SOC in parallel (non-fatal if it fails)
+        # Fetch battery SOC (non-fatal if it fails)
         battery_soc_pct = _fetch_battery_soc(system_id, api_key, access_token)
+        # Fetch weather (non-fatal if not configured or fails)
+        owm_key = _resolve_owm_api_key()
+        lat = os.environ.get("LOCATION_LAT", "")
+        lon = os.environ.get("LOCATION_LON", "")
+        weather = _fetch_weather(lat, lon, owm_key) if owm_key else None
+
         table = _dynamo.Table(table_name)
-        _write_reading(table, system_id, summary, battery_soc_pct=battery_soc_pct)
+        _write_reading(table, system_id, summary, battery_soc_pct=battery_soc_pct, weather=weather)
 
         # Alert if battery full and solar is being curtailed
         ntfy_topic   = _resolve_ntfy_topic()
@@ -438,13 +518,16 @@ def lambda_handler(event: dict, context) -> dict:
             "body": json.dumps({"ingested_at": now, "status": "error", "error": str(exc)}),
         }
 
-    return {
-        "statusCode": 200,
-        "body": json.dumps({
-            "ingested_at":     now,
-            "status":          "ok",
-            "energy_today_wh": summary.get("energy_today"),
-            "current_power_w": summary.get("current_power"),
-            "battery_soc_pct": battery_soc_pct,
-        }),
+    response_body: dict = {
+        "ingested_at":     now,
+        "status":          "ok",
+        "energy_today_wh": summary.get("energy_today"),
+        "current_power_w": summary.get("current_power"),
+        "battery_soc_pct": battery_soc_pct,
     }
+    if weather is not None:
+        response_body["cloud_cover_pct"]   = weather["cloud_cover_pct"]
+        response_body["temp_c"]            = weather["temp_c"]
+        response_body["weather_condition"] = weather["weather_condition"]
+
+    return {"statusCode": 200, "body": json.dumps(response_body)}

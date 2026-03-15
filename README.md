@@ -133,6 +133,11 @@ ENPHASE_REFRESH_TOKEN=your_oauth_refresh_token
 ENPHASE_CLIENT_ID=your_oauth_client_id
 ENPHASE_CLIENT_SECRET=your_oauth_client_secret
 
+# Optional: OpenWeatherMap current conditions (free tier API key)
+OPENWEATHER_API_KEY=your_owm_api_key
+LOCATION_LAT=37.8216
+LOCATION_LON=-121.9999
+
 # Optional: point at a real DynamoDB table (requires AWS credentials)
 ENERGY_TABLE=solar-ev-energy-readings
 ```
@@ -153,7 +158,7 @@ pytest tests/ -v
 
 All AWS calls are mocked with `moto` — no credentials or live infrastructure needed.
 
-Covered: `solar_data`, `recommendation`, and `ingest` Lambda handlers (including SSM helpers, OAuth token refresh, Enphase API calls, curtailment alert logic) plus shared utilities.
+Covered: `solar_data`, `recommendation`, and `ingest` Lambda handlers (including SSM helpers, OAuth token refresh, Enphase API calls, battery SOC, OpenWeatherMap fetch, curtailment alert logic) plus shared utilities.
 
 ### Frontend (TypeScript — Vitest + Testing Library)
 
@@ -209,6 +214,17 @@ aws ssm put-parameter --region $REGION --type SecureString \
 ```
 
 The ingest Lambda automatically refreshes the access token when it expires and writes the new token back to SSM — no manual rotation needed.
+
+### Store OpenWeatherMap API key in SSM (optional)
+
+The ingest Lambda fetches current weather conditions (cloud cover, temperature, condition) each hour and stores them alongside the solar snapshot. To enable it, get a free API key at [openweathermap.org](https://openweathermap.org/api) and store it:
+
+```bash
+aws ssm put-parameter --region $REGION --type SecureString \
+  --name /solar-ev/openweather-api-key --value "YOUR_OWM_API_KEY"
+```
+
+If the parameter is absent, weather fetching is silently skipped — ingest continues normally.
 
 ### Curtailment alerts via ntfy.sh (optional)
 
@@ -268,16 +284,19 @@ EventBridge (hourly)
   │ 2. GET /api/v4/systems/          │
   │    {id}/summary  (Enphase)       │
   │ 3. GET .../telemetry/battery     │
-  │ 4. Write snapshot to DynamoDB    │
+  │ 4. GET openweathermap.org/       │
+  │    data/2.5/weather  (OWM)       │
+  │ 5. Write snapshot to DynamoDB    │
   │    with 90-day TTL               │
-  │ 5. If battery ≥ 95% + solar      │
+  │ 6. If battery ≥ 95% + solar      │
   │    curtailed → POST ntfy.sh alert│
   └──────────────────────────────────┘
         │
         ▼
   DynamoDB: solar-ev-energy-readings
   PK: enphase-{system_id}  SK: timestamp (UTC ISO-8601)
-  Fields: energy_wh, power_w, summary_date (Pacific), battery_soc_pct
+  Fields: energy_wh, power_w, summary_date (Pacific),
+          battery_soc_pct, cloud_cover_pct, temp_c, weather_condition
         │
         ├──────────────────────┐
         ▼                      ▼
@@ -352,7 +371,7 @@ print(json.dumps(handler.lambda_handler({}, None), indent=2))
 
 | Feature | Where to start |
 |---------|---------------|
-| Weather-adjusted solar forecast | `backend/functions/ingest/handler.py` — add OpenWeatherMap fetch |
+| Weather-adjusted solar forecast | Use `cloud_cover_pct` already stored per hour — adjust solar estimate in `recommendation` handler |
 | Historical trend charts | Add date-range DynamoDB query to `solar_data`; new Recharts component |
 | User config (custom charge rate, schedule prefs) | `backend/functions/recommendation/handler.py` + `solar-ev-user-config` table |
 | EV charger scheduling | Enphase EVSE API requires a higher API tier; alternative: Home Assistant integration |

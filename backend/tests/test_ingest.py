@@ -651,5 +651,190 @@ class TestSendCurtailmentAlert(unittest.TestCase):
         self.assertIn("1200 W", captured["data"])
 
 
+# ---------------------------------------------------------------------------
+# _fetch_weather
+# ---------------------------------------------------------------------------
+
+class TestFetchWeather(unittest.TestCase):
+    """_fetch_weather parses OWM current weather response."""
+
+    def _fake_response(self, payload: dict):
+        body = json.dumps(payload).encode()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = body
+        return mock_resp
+
+    def _owm_payload(self, cloud_all=20, temp=15.3, condition="Clear"):
+        return {
+            "clouds": {"all": cloud_all},
+            "main":   {"temp": temp},
+            "weather": [{"main": condition}],
+        }
+
+    def test__fetch_weather_success(self):
+        payload = self._owm_payload(cloud_all=45, temp=12.7, condition="Clouds")
+        with patch("ingest_handler.urlopen", return_value=self._fake_response(payload)):
+            result = ingest._fetch_weather("37.82", "-121.99", "fake-key")
+        self.assertEqual(result["cloud_cover_pct"], 45)
+        self.assertEqual(result["temp_c"], 13)          # round(12.7)
+        self.assertEqual(result["weather_condition"], "Clouds")
+
+    def test__fetch_weather_http_error(self):
+        from urllib.error import HTTPError
+        err = HTTPError(url="", code=401, msg="Unauthorized", hdrs=None, fp=None)
+        with patch("ingest_handler.urlopen", side_effect=err):
+            result = ingest._fetch_weather("37.82", "-121.99", "bad-key")
+        self.assertIsNone(result)
+
+    def test__fetch_weather_network_error(self):
+        from urllib.error import URLError
+        with patch("ingest_handler.urlopen", side_effect=URLError("timeout")):
+            result = ingest._fetch_weather("37.82", "-121.99", "key")
+        self.assertIsNone(result)
+
+    def test__fetch_weather_missing_fields(self):
+        # Payload missing "clouds" key — should catch KeyError and return None
+        payload = {"main": {"temp": 15.0}, "weather": [{"main": "Clear"}]}
+        with patch("ingest_handler.urlopen", return_value=self._fake_response(payload)):
+            result = ingest._fetch_weather("37.82", "-121.99", "key")
+        self.assertIsNone(result)
+
+
+# ---------------------------------------------------------------------------
+# _write_reading with/without weather
+# ---------------------------------------------------------------------------
+
+class TestWriteReadingWeather(unittest.TestCase):
+    """_write_reading writes weather fields when provided, omits them when not."""
+
+    def _call(self, summary, battery_soc_pct=None, weather=None):
+        mock_table = MagicMock()
+        ingest._write_reading(mock_table, SYSTEM_ID, summary, battery_soc_pct, weather)
+        return mock_table.put_item.call_args[1]["Item"]
+
+    def test__write_reading_with_weather(self):
+        summary = {"energy_today": 0, "current_power": 0}
+        weather = {"cloud_cover_pct": 30, "temp_c": 18, "weather_condition": "Clear"}
+        item = self._call(summary, weather=weather)
+        self.assertEqual(item["cloud_cover_pct"], 30)
+        self.assertEqual(item["temp_c"], 18)
+        self.assertEqual(item["weather_condition"], "Clear")
+
+    def test__write_reading_without_weather(self):
+        summary = {"energy_today": 0, "current_power": 0}
+        item = self._call(summary, weather=None)
+        self.assertNotIn("cloud_cover_pct", item)
+        self.assertNotIn("temp_c", item)
+        self.assertNotIn("weather_condition", item)
+
+
+# ---------------------------------------------------------------------------
+# lambda_handler — weather integration
+# ---------------------------------------------------------------------------
+
+@mock_aws
+class TestIngestLambdaHandlerWeather(unittest.TestCase):
+    """lambda_handler includes weather in response and tolerates OWM failures."""
+
+    def setUp(self):
+        ddb = boto3.resource("dynamodb", region_name="us-east-1")
+        ingest._dynamo = ddb
+        self.table = _make_table(ddb)
+        os.environ["ENERGY_TABLE"]            = TABLE_NAME
+        os.environ["ENPHASE_SYSTEM_ID"]       = SYSTEM_ID
+        os.environ["ENPHASE_API_KEY"]         = "test-key"
+        os.environ["ENPHASE_ACCESS_TOKEN"]    = "test-token"
+        os.environ["ENPHASE_CLIENT_ID"]       = "test-client"
+        os.environ["ENPHASE_CLIENT_SECRET"]   = "test-secret"
+        os.environ["OPENWEATHER_API_KEY"]     = "owm-key"
+        os.environ["LOCATION_LAT"]            = "37.8216"
+        os.environ["LOCATION_LON"]            = "-121.9999"
+
+    def tearDown(self):
+        for key in (
+            "ENERGY_TABLE", "ENPHASE_SYSTEM_ID",
+            "ENPHASE_API_KEY", "ENPHASE_ACCESS_TOKEN",
+            "ENPHASE_CLIENT_ID", "ENPHASE_CLIENT_SECRET",
+            "OPENWEATHER_API_KEY", "LOCATION_LAT", "LOCATION_LON",
+        ):
+            os.environ.pop(key, None)
+
+    def _fake_urlopen(self, summary_payload, battery_payload, weather_payload):
+        def fake(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if "battery" in url:
+                payload = battery_payload
+            elif "openweathermap" in url:
+                payload = weather_payload
+            else:
+                payload = summary_payload
+            body = json.dumps(payload).encode()
+            mock_resp = MagicMock()
+            mock_resp.__enter__ = lambda s: s
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            mock_resp.read.return_value = body
+            return mock_resp
+        return fake
+
+    def test_lambda_handler_includes_weather(self):
+        summary_payload = {
+            "current_power": 3000, "energy_today": 9000,
+            "summary_date": "2026-03-15", "last_report_at": 1741651200,
+        }
+        battery_payload = {"intervals": [{"soc": {"percent": "85"}}]}
+        weather_payload = {
+            "clouds": {"all": 10},
+            "main":   {"temp": 20.0},
+            "weather": [{"main": "Clear"}],
+        }
+
+        with patch("ingest_handler.urlopen",
+                   side_effect=self._fake_urlopen(summary_payload, battery_payload, weather_payload)):
+            result = ingest.lambda_handler({}, None)
+
+        body = json.loads(result["body"])
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["cloud_cover_pct"], 10)
+        self.assertEqual(body["temp_c"], 20)
+        self.assertEqual(body["weather_condition"], "Clear")
+
+        items = self.table.scan()["Items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["cloud_cover_pct"], 10)
+        self.assertEqual(items[0]["weather_condition"], "Clear")
+
+    def test_lambda_handler_weather_failure_non_fatal(self):
+        from urllib.error import URLError
+        summary_payload = {
+            "current_power": 2000, "energy_today": 5000,
+            "summary_date": "2026-03-15", "last_report_at": 1741651200,
+        }
+        battery_payload = {"intervals": []}
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if "openweathermap" in url:
+                raise URLError("network down")
+            payload = battery_payload if "battery" in url else summary_payload
+            body = json.dumps(payload).encode()
+            mock_resp = MagicMock()
+            mock_resp.__enter__ = lambda s: s
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            mock_resp.read.return_value = body
+            return mock_resp
+
+        with patch("ingest_handler.urlopen", side_effect=fake_urlopen):
+            result = ingest.lambda_handler({}, None)
+
+        body = json.loads(result["body"])
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(body["status"], "ok")
+        self.assertNotIn("cloud_cover_pct", body)
+        self.assertNotIn("weather_condition", body)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -115,8 +115,8 @@ export class SolarEvStack extends cdk.Stack {
         ...sharedEnv,
         // Non-sensitive config — safe as plain env vars
         ENPHASE_SYSTEM_ID: "6046451",
-        LOCATION_LAT: "37.7749",
-        LOCATION_LON: "-122.4194",
+        LOCATION_LAT: "37.8216",
+        LOCATION_LON: "-121.9999",
         // SSM paths — Lambda reads and decrypts these at runtime
         ENPHASE_API_KEY_PARAM:       `${SSM_PREFIX}/enphase-api-key`,
         ENPHASE_ACCESS_TOKEN_PARAM:  `${SSM_PREFIX}/enphase-access-token`,
