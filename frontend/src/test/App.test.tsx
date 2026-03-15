@@ -33,7 +33,6 @@ describe("App", () => {
 
     render(<App />);
     // Loading skeleton uses animate-pulse; look for any structural indicator
-    const { container } = render(<App />);
     // Check that success content is NOT visible yet
     expect(screen.queryByText(/Today's production/i)).not.toBeInTheDocument();
   });
