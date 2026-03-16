@@ -34,7 +34,7 @@ function WeatherWidget({ weather }: { weather: Weather }) {
     <div className="text-right">
       <p className="text-xs text-gray-500">Current weather</p>
       <p className="text-lg font-semibold text-gray-200">
-        {weatherIcon(weather.weather_condition)} {weather.temp_c}°C
+        {weatherIcon(weather.weather_condition)} {weather.temp_c}°C / {Math.round(weather.temp_c * 9 / 5 + 32)}°F
       </p>
       <p className="text-xs text-gray-400">{weather.cloud_cover_pct}% cloud cover</p>
     </div>
