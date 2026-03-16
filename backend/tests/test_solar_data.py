@@ -266,6 +266,34 @@ class TestSolarDataLambdaHandler(unittest.TestCase):
         body = json.loads(result["body"])
         self.assertEqual(body["home_battery_capacity_wh"], 20000)
 
+    def test_weather_from_latest_item(self):
+        os.environ["ENPHASE_SYSTEM_ID"] = SYSTEM_ID
+        os.environ["ENERGY_TABLE"] = TABLE_NAME
+        self.table.put_item(Item=_item(
+            "2026-03-10T17:00:00+00:00", 2000, "2026-03-10"
+        ))
+        self.table.put_item(Item={
+            **_item("2026-03-10T19:00:00+00:00", 4000, "2026-03-10"),
+            "cloud_cover_pct":   10,
+            "temp_c":            18,
+            "weather_condition": "Clear",
+        })
+        result = self._call()
+        body = json.loads(result["body"])
+        self.assertEqual(body["weather"]["cloud_cover_pct"], 10)
+        self.assertEqual(body["weather"]["temp_c"], 18)
+        self.assertEqual(body["weather"]["weather_condition"], "Clear")
+
+    def test_weather_none_when_no_items_have_it(self):
+        os.environ["ENPHASE_SYSTEM_ID"] = SYSTEM_ID
+        os.environ["ENERGY_TABLE"] = TABLE_NAME
+        self.table.put_item(Item=_item(
+            "2026-03-10T18:00:00+00:00", 3000, "2026-03-10"
+        ))
+        result = self._call()
+        body = json.loads(result["body"])
+        self.assertIsNone(body["weather"])
+
 
 if __name__ == "__main__":
     unittest.main()

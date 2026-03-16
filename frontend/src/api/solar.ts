@@ -27,6 +27,12 @@ export interface TouPeriod {
   color: string;
 }
 
+export interface Weather {
+  cloud_cover_pct: number;
+  temp_c: number;
+  weather_condition: string;
+}
+
 export interface SolarTodayResponse {
   date: string;
   system_id: string;
@@ -37,6 +43,7 @@ export interface SolarTodayResponse {
   data_source: "enphase" | "mock";
   home_battery_soc_pct: number | null;
   home_battery_capacity_wh: number;
+  weather: Weather | null;
 }
 
 export interface ChargingWindow {

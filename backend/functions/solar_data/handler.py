@@ -205,6 +205,7 @@ def lambda_handler(event: dict, context: Any) -> dict:
         readings         = None
         data_source      = "mock"
         battery_soc_pct  = None   # home battery SOC %, filled from latest DynamoDB item
+        weather          = None   # current weather, filled from latest DynamoDB item
 
         # --- Real data from DynamoDB ---
         if system_id and table_name:
@@ -221,6 +222,15 @@ def lambda_handler(event: dict, context: Any) -> dict:
                     for item in reversed(items):
                         if "battery_soc_pct" in item:
                             battery_soc_pct = int(item["battery_soc_pct"])
+                            break
+                    # Most-recent item that includes weather data
+                    for item in reversed(items):
+                        if "cloud_cover_pct" in item:
+                            weather = {
+                                "cloud_cover_pct":   int(item["cloud_cover_pct"]),
+                                "temp_c":            int(item["temp_c"]),
+                                "weather_condition": str(item["weather_condition"]),
+                            }
                             break
                 else:
                     logger.info("No DynamoDB rows for %s — using mock data", date_str)
@@ -244,6 +254,7 @@ def lambda_handler(event: dict, context: Any) -> dict:
             "data_source":               data_source,
             "home_battery_soc_pct":      battery_soc_pct,       # null when unknown
             "home_battery_capacity_wh":  20000,                  # 4 × IQ Battery 5P
+            "weather":                   weather,                # null when unavailable
         }
 
         logger.info(

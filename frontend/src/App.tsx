@@ -1,9 +1,24 @@
 import { useEffect, useRef, useState } from "react";
 import { fetchSolarToday, fetchRecommendation } from "./api/solar";
-import type { SolarTodayResponse, RecommendationResponse } from "./api/solar";
+import type { SolarTodayResponse, RecommendationResponse, Weather } from "./api/solar";
 import { SolarChart } from "./components/SolarChart";
 import { TouTimeline } from "./components/TouTimeline";
 import { RecommendationCard } from "./components/RecommendationCard";
+
+function weatherIcon(condition: string): string {
+  switch (condition) {
+    case "Clear":       return "☀️";
+    case "Clouds":      return "☁️";
+    case "Rain":
+    case "Drizzle":     return "🌧️";
+    case "Thunderstorm":return "⛈️";
+    case "Snow":        return "❄️";
+    case "Fog":
+    case "Mist":
+    case "Haze":        return "🌫️";
+    default:            return "🌤️";
+  }
+}
 
 type Status = "idle" | "loading" | "success" | "error";
 
@@ -12,6 +27,18 @@ interface AppState {
   recommendation: RecommendationResponse | null;
   status: Status;
   error: string | null;
+}
+
+function WeatherWidget({ weather }: { weather: Weather }) {
+  return (
+    <div className="text-right">
+      <p className="text-xs text-gray-500">Current weather</p>
+      <p className="text-lg font-semibold text-gray-200">
+        {weatherIcon(weather.weather_condition)} {weather.temp_c}°C
+      </p>
+      <p className="text-xs text-gray-400">{weather.cloud_cover_pct}% cloud cover</p>
+    </div>
+  );
 }
 
 export default function App() {
@@ -89,12 +116,17 @@ export default function App() {
             </div>
           </div>
           {solar && (
-            <div className="text-right">
-              <p className="text-xs text-gray-500">Today's production</p>
-              <p className="text-xl font-bold text-yellow-400">{solar.total_production_kwh} kWh</p>
-              {currentPowerW !== null && (
-                <p className="text-xs text-green-400 mt-0.5">{currentPowerW} W now</p>
+            <div className="flex items-center gap-6">
+              {solar.weather && (
+                <WeatherWidget weather={solar.weather} />
               )}
+              <div className="text-right">
+                <p className="text-xs text-gray-500">Today's production</p>
+                <p className="text-xl font-bold text-yellow-400">{solar.total_production_kwh} kWh</p>
+                {currentPowerW !== null && (
+                  <p className="text-xs text-green-400 mt-0.5">{currentPowerW} W now</p>
+                )}
+              </div>
             </div>
           )}
         </div>

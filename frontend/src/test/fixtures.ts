@@ -21,6 +21,7 @@ export const MOCK_SOLAR: SolarTodayResponse = {
   data_source: "enphase",
   home_battery_soc_pct: 72,
   home_battery_capacity_wh: 20000,
+  weather: { cloud_cover_pct: 20, temp_c: 18, weather_condition: "Clear" },
 };
 
 export const MOCK_RECOMMENDATION: RecommendationResponse = {
