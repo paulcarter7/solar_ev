@@ -1,6 +1,15 @@
 import { useEffect, useRef, useState } from "react";
-import { fetchSolarToday, fetchRecommendation } from "./api/solar";
-import type { SolarTodayResponse, RecommendationResponse, Weather } from "./api/solar";
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+} from "recharts";
+import { fetchSolarToday, fetchRecommendation, fetchHistory } from "./api/solar";
+import type { SolarTodayResponse, RecommendationResponse, HistoryResponse, Weather } from "./api/solar";
 import { SolarChart } from "./components/SolarChart";
 import { TouTimeline } from "./components/TouTimeline";
 import { RecommendationCard } from "./components/RecommendationCard";
@@ -25,6 +34,7 @@ type Status = "idle" | "loading" | "success" | "error";
 interface AppState {
   solar: SolarTodayResponse | null;
   recommendation: RecommendationResponse | null;
+  history: HistoryResponse | null;
   status: Status;
   error: string | null;
 }
@@ -45,9 +55,13 @@ export default function App() {
   const [state, setState] = useState<AppState>({
     solar: null,
     recommendation: null,
+    history: null,
     status: "idle",
     error: null,
   });
+
+  const [historyDays, setHistoryDays] = useState(14);
+  const [historyLoading, setHistoryLoading] = useState(false);
 
   // SOC = State of Charge (battery %). Default 30%, target 80%.
   const [currentSoc, setCurrentSoc] = useState(30);
@@ -66,10 +80,11 @@ export default function App() {
     Promise.all([
       fetchSolarToday(localToday),
       fetchRecommendation({ current_soc: currentSoc / 100, target_soc: 0.8, date: localToday }),
+      fetchHistory(14),
     ])
-      .then(([solar, recommendation]) => {
+      .then(([solar, recommendation, history]) => {
         initialized.current = true;
-        setState({ solar, recommendation, status: "success", error: null });
+        setState({ solar, recommendation, history, status: "success", error: null });
       })
       .catch((err: Error) => {
         setState((s) => ({ ...s, status: "error", error: err.message }));
@@ -92,7 +107,18 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [currentSoc]);
 
-  const { solar, recommendation, status, error } = state;
+  const handleHistoryDaysChange = (days: number) => {
+    setHistoryDays(days);
+    setHistoryLoading(true);
+    fetchHistory(days)
+      .then((history) => {
+        setState((s) => ({ ...s, history }));
+        setHistoryLoading(false);
+      })
+      .catch(() => setHistoryLoading(false));
+  };
+
+  const { solar, recommendation, history, status, error } = state;
 
   // Most-recent instantaneous power reading (W) from real Enphase data
   const liveReadings = solar?.hourly_readings.filter(
@@ -209,6 +235,86 @@ export default function App() {
                 <p className="text-xs text-center text-gray-500 animate-pulse">Updating recommendation…</p>
               )}
             </section>
+
+            {/* Production history chart */}
+            {history && (
+              <section className="rounded-2xl bg-gray-800 border border-gray-700 p-5 space-y-3">
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <div>
+                    <h2 className="text-sm font-semibold text-gray-200">Production History</h2>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      Avg {history.avg_production_kwh} kWh/day
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {[7, 14, 30].map((d) => (
+                      <button
+                        key={d}
+                        onClick={() => handleHistoryDaysChange(d)}
+                        className={`text-xs px-3 py-1 rounded-full border transition-colors ${
+                          historyDays === d
+                            ? "bg-blue-600 border-blue-500 text-white"
+                            : "border-gray-600 text-gray-400 hover:border-gray-400 hover:text-gray-200"
+                        }`}
+                      >
+                        {d}d
+                      </button>
+                    ))}
+                    {history.data_source === "enphase" ? (
+                      <span className="text-xs bg-green-900/50 text-green-400 border border-green-800 px-2 py-0.5 rounded-full">● live</span>
+                    ) : (
+                      <span className="text-xs bg-gray-700 text-gray-400 px-2 py-0.5 rounded-full">mock data</span>
+                    )}
+                  </div>
+                </div>
+                <div className={historyLoading ? "opacity-50 transition-opacity" : "transition-opacity"}>
+                  <ResponsiveContainer width="100%" height={200}>
+                    <BarChart
+                      data={history.days}
+                      margin={{ top: 4, right: 16, left: 0, bottom: 0 }}
+                    >
+                      <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                      <XAxis
+                        dataKey="date"
+                        tick={{ fill: "#9ca3af", fontSize: 10 }}
+                        tickFormatter={(d: string) => {
+                          const dt = new Date(d + "T12:00:00");
+                          return dt.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+                        }}
+                        interval={Math.floor(history.days.length / 7)}
+                        tickLine={false}
+                      />
+                      <YAxis
+                        tick={{ fill: "#9ca3af", fontSize: 11 }}
+                        tickFormatter={(v: number) => `${v}`}
+                        unit=" kWh"
+                        width={56}
+                      />
+                      <Tooltip
+                        contentStyle={{ backgroundColor: "#1f2937", border: "1px solid #374151", borderRadius: 8 }}
+                        labelStyle={{ color: "#f9fafb" }}
+                        labelFormatter={(d: string) =>
+                          new Date(d + "T12:00:00").toLocaleDateString("en-US", {
+                            weekday: "short", month: "short", day: "numeric",
+                          })
+                        }
+                        formatter={(value: number, _name: string, props: { payload?: { peak_power_w: number } }) => {
+                          const peak = props.payload?.peak_power_w;
+                          const peakStr = peak && peak > 0 ? `  ·  peak ${peak} W` : "";
+                          return [`${value.toFixed(2)} kWh${peakStr}`, "Production"];
+                        }}
+                      />
+                      <Bar
+                        dataKey="total_production_kwh"
+                        fill="#3b82f6"
+                        radius={[3, 3, 0, 0]}
+                        maxBarSize={40}
+                      />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </section>
+            )}
 
             {/* Alternate windows table */}
             <section className="rounded-2xl bg-gray-800 border border-gray-700 p-5 space-y-3">

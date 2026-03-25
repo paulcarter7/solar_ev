@@ -100,6 +100,22 @@ async function get<T>(path: string, params?: Record<string, string>): Promise<T>
 // API functions
 // ---------------------------------------------------------------------------
 
+export interface DayProduction {
+  date: string;
+  total_production_kwh: number;
+  peak_power_w: number;
+  data_source: "enphase" | "no_data";
+}
+
+export interface HistoryResponse {
+  start_date: string;
+  end_date: string;
+  days_requested: number;
+  days: DayProduction[];
+  avg_production_kwh: number;
+  data_source: "enphase" | "mock";
+}
+
 export const fetchSolarToday = (date?: string) =>
   get<SolarTodayResponse>("/solar/today", date ? { date } : undefined);
 
@@ -110,3 +126,6 @@ export const fetchRecommendation = (params?: { current_soc?: number; target_soc?
   if (params?.date !== undefined) qp.date = params.date;
   return get<RecommendationResponse>("/recommendation", Object.keys(qp).length ? qp : undefined);
 };
+
+export const fetchHistory = (days?: number) =>
+  get<HistoryResponse>("/solar/history", days ? { days: String(days) } : undefined);

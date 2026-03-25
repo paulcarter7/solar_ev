@@ -6,8 +6,8 @@
  * - fetchRecommendation: parameter encoding, partial params, error handling
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { fetchSolarToday, fetchRecommendation } from "../api/solar";
-import { MOCK_SOLAR, MOCK_RECOMMENDATION } from "./fixtures";
+import { fetchSolarToday, fetchRecommendation, fetchHistory } from "../api/solar";
+import { MOCK_SOLAR, MOCK_RECOMMENDATION, MOCK_HISTORY } from "./fixtures";
 
 function mockFetch(data: unknown, ok = true, status = 200) {
   return vi.fn().mockResolvedValue({
@@ -128,5 +128,45 @@ describe("fetchRecommendation", () => {
   it("throws with status code on non-ok response", async () => {
     vi.stubGlobal("fetch", mockFetch({}, false, 500));
     await expect(fetchRecommendation()).rejects.toThrow("API 500");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fetchHistory
+// ---------------------------------------------------------------------------
+
+describe("fetchHistory", () => {
+  it("calls /solar/history with no params when days is omitted", async () => {
+    const mock = mockFetch(MOCK_HISTORY);
+    vi.stubGlobal("fetch", mock);
+
+    await fetchHistory();
+
+    const calledUrl = mock.mock.calls[0][0] as string;
+    expect(calledUrl).toContain("/solar/history");
+    expect(calledUrl).not.toContain("days=");
+  });
+
+  it("appends days query param when provided", async () => {
+    const mock = mockFetch(MOCK_HISTORY);
+    vi.stubGlobal("fetch", mock);
+
+    await fetchHistory(30);
+
+    const calledUrl = mock.mock.calls[0][0] as string;
+    expect(calledUrl).toContain("days=30");
+  });
+
+  it("returns parsed history on success", async () => {
+    vi.stubGlobal("fetch", mockFetch(MOCK_HISTORY));
+    const result = await fetchHistory(7);
+    expect(result.days_requested).toBe(7);
+    expect(result.days).toHaveLength(7);
+    expect(result.avg_production_kwh).toBe(19.3);
+  });
+
+  it("throws with status code on non-ok response", async () => {
+    vi.stubGlobal("fetch", mockFetch({}, false, 500));
+    await expect(fetchHistory(7)).rejects.toThrow("API 500");
   });
 });

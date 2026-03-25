@@ -92,6 +92,25 @@ export class SolarEvStack extends cdk.Stack {
     configTable.grantReadData(recommendationFn);
 
     // -------------------------------------------------------------------------
+    // Lambda: history — returns N days of daily production totals
+    // -------------------------------------------------------------------------
+    const historyFn = new lambda.Function(this, "HistoryFn", {
+      functionName: "solar-ev-history",
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: "handler.lambda_handler",
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, "../../backend/functions/history")
+      ),
+      environment: sharedEnv,
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 256,
+      logRetention: logs.RetentionDays.ONE_MONTH,
+      description: "Returns daily production totals for the requested date range",
+    });
+
+    energyTable.grantReadData(historyFn);
+
+    // -------------------------------------------------------------------------
     // Lambda: ingest — runs on schedule to pull Enphase + weather data
     // -------------------------------------------------------------------------
     // SSM parameter paths for secrets — values stored via:
@@ -188,12 +207,18 @@ export class SolarEvStack extends cdk.Stack {
       },
     });
 
-    // GET /solar/today
+    // GET /solar/today  and  GET /solar/history
     const solar = api.root.addResource("solar");
     const solarToday = solar.addResource("today");
     solarToday.addMethod(
       "GET",
       new apigateway.LambdaIntegration(solarDataFn, { proxy: true })
+    );
+
+    const solarHistory = solar.addResource("history");
+    solarHistory.addMethod(
+      "GET",
+      new apigateway.LambdaIntegration(historyFn, { proxy: true })
     );
 
     // GET /recommendation

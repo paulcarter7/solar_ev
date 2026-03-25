@@ -72,6 +72,10 @@ def _build_routes() -> dict:
             os.path.join(fn_dir, "solar_data", "handler.py"),
             "solar_data_handler",
         ),
+        "/solar/history": _load_handler_from_file(
+            os.path.join(fn_dir, "history", "handler.py"),
+            "history_handler",
+        ),
         "/recommendation": _load_handler_from_file(
             os.path.join(fn_dir, "recommendation", "handler.py"),
             "recommendation_handler",
@@ -140,6 +144,7 @@ def main():
     DevHandler.routes = _build_routes()
     print(f"Local API server running on http://localhost:{PORT}")
     print(f"  GET /solar/today")
+    print(f"  GET /solar/history?days=14")
     print(f"  GET /recommendation?current_soc=0.3&target_soc=0.8")
     print(f"  Ctrl-C to stop\n")
     server = HTTPServer(("localhost", PORT), DevHandler)

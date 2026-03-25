@@ -12,7 +12,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import App from "../App";
 import * as solarApi from "../api/solar";
-import { MOCK_SOLAR, MOCK_RECOMMENDATION } from "./fixtures";
+import { MOCK_SOLAR, MOCK_RECOMMENDATION, MOCK_HISTORY } from "./fixtures";
 
 beforeEach(() => {
   Object.defineProperty(window, "location", {
@@ -30,6 +30,7 @@ describe("App", () => {
     // fetchSolarToday never resolves — keeps the component in loading state
     vi.spyOn(solarApi, "fetchSolarToday").mockReturnValue(new Promise(() => {}));
     vi.spyOn(solarApi, "fetchRecommendation").mockReturnValue(new Promise(() => {}));
+    vi.spyOn(solarApi, "fetchHistory").mockReturnValue(new Promise(() => {}));
 
     render(<App />);
     // Loading skeleton uses animate-pulse; look for any structural indicator
@@ -40,6 +41,7 @@ describe("App", () => {
   it("renders solar production and recommendation after successful fetch", async () => {
     vi.spyOn(solarApi, "fetchSolarToday").mockResolvedValue(MOCK_SOLAR);
     vi.spyOn(solarApi, "fetchRecommendation").mockResolvedValue(MOCK_RECOMMENDATION);
+    vi.spyOn(solarApi, "fetchHistory").mockResolvedValue(MOCK_HISTORY);
 
     render(<App />);
 
@@ -56,17 +58,20 @@ describe("App", () => {
   it("shows live badge for enphase data source", async () => {
     vi.spyOn(solarApi, "fetchSolarToday").mockResolvedValue(MOCK_SOLAR);
     vi.spyOn(solarApi, "fetchRecommendation").mockResolvedValue(MOCK_RECOMMENDATION);
+    vi.spyOn(solarApi, "fetchHistory").mockResolvedValue(MOCK_HISTORY);
 
     render(<App />);
     await waitFor(() => screen.getByText("24 kWh"));
 
-    expect(screen.getByText(/● live/i)).toBeInTheDocument();
+    // Both the solar production section and history section show live badges
+    expect(screen.getAllByText(/● live/i).length).toBeGreaterThanOrEqual(1);
   });
 
   it("shows mock data badge for mock data source", async () => {
     const mockSolar = { ...MOCK_SOLAR, data_source: "mock" as const };
     vi.spyOn(solarApi, "fetchSolarToday").mockResolvedValue(mockSolar);
     vi.spyOn(solarApi, "fetchRecommendation").mockResolvedValue(MOCK_RECOMMENDATION);
+    vi.spyOn(solarApi, "fetchHistory").mockResolvedValue(MOCK_HISTORY);
 
     render(<App />);
     await waitFor(() => screen.getByText("24 kWh"));
@@ -77,6 +82,7 @@ describe("App", () => {
   it("renders error state when fetch fails", async () => {
     vi.spyOn(solarApi, "fetchSolarToday").mockRejectedValue(new Error("Network error"));
     vi.spyOn(solarApi, "fetchRecommendation").mockRejectedValue(new Error("Network error"));
+    vi.spyOn(solarApi, "fetchHistory").mockRejectedValue(new Error("Network error"));
 
     render(<App />);
 
@@ -89,6 +95,7 @@ describe("App", () => {
   it("renders the all-candidates table with window times", async () => {
     vi.spyOn(solarApi, "fetchSolarToday").mockResolvedValue(MOCK_SOLAR);
     vi.spyOn(solarApi, "fetchRecommendation").mockResolvedValue(MOCK_RECOMMENDATION);
+    vi.spyOn(solarApi, "fetchHistory").mockResolvedValue(MOCK_HISTORY);
 
     render(<App />);
     await waitFor(() => screen.getByText("24 kWh"));
@@ -102,11 +109,28 @@ describe("App", () => {
   it("renders current power reading when enphase readings have power_w", async () => {
     vi.spyOn(solarApi, "fetchSolarToday").mockResolvedValue(MOCK_SOLAR);
     vi.spyOn(solarApi, "fetchRecommendation").mockResolvedValue(MOCK_RECOMMENDATION);
+    vi.spyOn(solarApi, "fetchHistory").mockResolvedValue(MOCK_HISTORY);
 
     render(<App />);
     await waitFor(() => screen.getByText("24 kWh"));
 
     // Last enphase reading with power_w = 5000 should show as live power
     expect(screen.getByText(/5000 W now/i)).toBeInTheDocument();
+  });
+
+  it("renders production history section with avg and day/window buttons", async () => {
+    vi.spyOn(solarApi, "fetchSolarToday").mockResolvedValue(MOCK_SOLAR);
+    vi.spyOn(solarApi, "fetchRecommendation").mockResolvedValue(MOCK_RECOMMENDATION);
+    vi.spyOn(solarApi, "fetchHistory").mockResolvedValue(MOCK_HISTORY);
+
+    render(<App />);
+    await waitFor(() => screen.getByText("24 kWh"));
+
+    expect(screen.getByText("Production History")).toBeInTheDocument();
+    expect(screen.getByText(/Avg 19\.3 kWh\/day/)).toBeInTheDocument();
+    // Preset buttons
+    expect(screen.getByRole("button", { name: "7d" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "14d" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "30d" })).toBeInTheDocument();
   });
 });

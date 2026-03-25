@@ -1,7 +1,7 @@
 /**
  * Shared test fixtures — minimal valid API response shapes.
  */
-import type { SolarTodayResponse, RecommendationResponse } from "../api/solar";
+import type { SolarTodayResponse, RecommendationResponse, HistoryResponse } from "../api/solar";
 
 export const MOCK_SOLAR: SolarTodayResponse = {
   date: "2026-03-11",
@@ -49,4 +49,21 @@ export const MOCK_RECOMMENDATION: RecommendationResponse = {
   home_battery_soc_pct: 72,
   charging_source: "solar_direct",
   charging_source_label: "Direct Solar",
+};
+
+export const MOCK_HISTORY: HistoryResponse = {
+  start_date: "2026-03-10",
+  end_date: "2026-03-16",
+  days_requested: 7,
+  days: [
+    { date: "2026-03-10", total_production_kwh: 22.5, peak_power_w: 4200, data_source: "enphase" },
+    { date: "2026-03-11", total_production_kwh: 24.0, peak_power_w: 4500, data_source: "enphase" },
+    { date: "2026-03-12", total_production_kwh: 18.3, peak_power_w: 3800, data_source: "enphase" },
+    { date: "2026-03-13", total_production_kwh: 0.0,  peak_power_w: 0,    data_source: "no_data" },
+    { date: "2026-03-14", total_production_kwh: 25.1, peak_power_w: 4700, data_source: "enphase" },
+    { date: "2026-03-15", total_production_kwh: 23.8, peak_power_w: 4300, data_source: "enphase" },
+    { date: "2026-03-16", total_production_kwh: 21.2, peak_power_w: 4100, data_source: "enphase" },
+  ],
+  avg_production_kwh: 19.3,
+  data_source: "enphase",
 };
