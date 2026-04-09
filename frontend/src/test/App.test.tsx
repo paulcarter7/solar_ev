@@ -106,6 +106,42 @@ describe("App", () => {
     expect(screen.getAllByText(/\$3\.25/).length).toBeGreaterThanOrEqual(1);
   });
 
+  it("renders home battery SOC in header when home_battery_soc_pct is set", async () => {
+    vi.spyOn(solarApi, "fetchSolarToday").mockResolvedValue(MOCK_SOLAR);
+    vi.spyOn(solarApi, "fetchRecommendation").mockResolvedValue(MOCK_RECOMMENDATION);
+    vi.spyOn(solarApi, "fetchHistory").mockResolvedValue(MOCK_HISTORY);
+
+    render(<App />);
+    await waitFor(() => screen.getByText("24 kWh"));
+
+    expect(screen.getByText("Home battery")).toBeInTheDocument();
+    expect(screen.getByText("72%")).toBeInTheDocument();
+    expect(screen.getByText("of 20 kWh")).toBeInTheDocument();
+  });
+
+  it("hides home battery widget when home_battery_soc_pct is null", async () => {
+    const solarNoSoc = { ...MOCK_SOLAR, home_battery_soc_pct: null };
+    vi.spyOn(solarApi, "fetchSolarToday").mockResolvedValue(solarNoSoc);
+    vi.spyOn(solarApi, "fetchRecommendation").mockResolvedValue(MOCK_RECOMMENDATION);
+    vi.spyOn(solarApi, "fetchHistory").mockResolvedValue(MOCK_HISTORY);
+
+    render(<App />);
+    await waitFor(() => screen.getByText("24 kWh"));
+
+    expect(screen.queryByText("Home battery")).not.toBeInTheDocument();
+  });
+
+  it("labels the SOC slider as EV battery level", async () => {
+    vi.spyOn(solarApi, "fetchSolarToday").mockResolvedValue(MOCK_SOLAR);
+    vi.spyOn(solarApi, "fetchRecommendation").mockResolvedValue(MOCK_RECOMMENDATION);
+    vi.spyOn(solarApi, "fetchHistory").mockResolvedValue(MOCK_HISTORY);
+
+    render(<App />);
+    await waitFor(() => screen.getByText("24 kWh"));
+
+    expect(screen.getByText(/EV battery level/i)).toBeInTheDocument();
+  });
+
   it("renders current power reading when enphase readings have power_w", async () => {
     vi.spyOn(solarApi, "fetchSolarToday").mockResolvedValue(MOCK_SOLAR);
     vi.spyOn(solarApi, "fetchRecommendation").mockResolvedValue(MOCK_RECOMMENDATION);

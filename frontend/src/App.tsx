@@ -146,6 +146,13 @@ export default function App() {
               {solar.weather && (
                 <WeatherWidget weather={solar.weather} />
               )}
+              {solar.home_battery_soc_pct !== null && (
+                <div className="text-right">
+                  <p className="text-xs text-gray-500">Home battery</p>
+                  <p className="text-xl font-bold text-emerald-400">{solar.home_battery_soc_pct}%</p>
+                  <p className="text-xs text-gray-400">of 20 kWh</p>
+                </div>
+              )}
               <div className="text-right">
                 <p className="text-xs text-gray-500">Today's production</p>
                 <p className="text-xl font-bold text-yellow-400">{solar.total_production_kwh} kWh</p>
@@ -206,7 +213,7 @@ export default function App() {
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <label className="text-sm font-semibold text-gray-200">
-                    🔋 Current battery level
+                    🔋 EV battery level
                   </label>
                   <span className="text-lg font-bold text-blue-400">{currentSoc}%</span>
                 </div>
