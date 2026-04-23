@@ -160,6 +160,26 @@ class TestFetchBatterySOC(unittest.TestCase):
 # lambda_handler
 # ---------------------------------------------------------------------------
 
+def _make_daytime_datetime_mock():
+    """Return a mock for `ingest_handler.datetime` pinned to 08:00 Pacific (daytime, div by 4)."""
+    from datetime import datetime as real_datetime
+    from zoneinfo import ZoneInfo
+    pacific = ZoneInfo("America/Los_Angeles")
+    fake_pac = real_datetime(2026, 3, 11, 8, 0, tzinfo=pacific)
+    fake_utc = fake_pac.astimezone(timezone.utc)
+
+    def fake_now(tz=None):
+        if tz is not None and getattr(tz, "key", None) == "America/Los_Angeles":
+            return fake_pac
+        return fake_utc
+
+    mock_dt = MagicMock()
+    mock_dt.now.side_effect = fake_now
+    mock_dt.fromisoformat = real_datetime.fromisoformat
+    mock_dt.fromtimestamp = real_datetime.fromtimestamp
+    return mock_dt
+
+
 @mock_aws
 class TestIngestLambdaHandler(unittest.TestCase):
     """lambda_handler integration: skips gracefully, writes on success."""
@@ -169,8 +189,12 @@ class TestIngestLambdaHandler(unittest.TestCase):
         ingest._dynamo = ddb
         self.table = _make_table(ddb)
         os.environ["ENERGY_TABLE"] = TABLE_NAME
+        # Pin time to 10am Pacific so nighttime skip never fires in these tests
+        self._dt_patcher = patch("ingest_handler.datetime", _make_daytime_datetime_mock())
+        self._dt_patcher.start()
 
     def tearDown(self):
+        self._dt_patcher.stop()
         for key in ("ENERGY_TABLE", "ENPHASE_SYSTEM_ID",
                     "ENPHASE_API_KEY", "ENPHASE_ACCESS_TOKEN",
                     "ENPHASE_CLIENT_ID", "ENPHASE_CLIENT_SECRET"):
@@ -751,8 +775,13 @@ class TestIngestLambdaHandlerWeather(unittest.TestCase):
         os.environ["OPENWEATHER_API_KEY"]     = "owm-key"
         os.environ["LOCATION_LAT"]            = "37.8216"
         os.environ["LOCATION_LON"]            = "-121.9999"
+        # Pin time to 10am Pacific (divisible by 2 but not 4 — battery throttle test
+        # in this class doesn't apply; we just need daytime and avoid nighttime skip)
+        self._dt_patcher = patch("ingest_handler.datetime", _make_daytime_datetime_mock())
+        self._dt_patcher.start()
 
     def tearDown(self):
+        self._dt_patcher.stop()
         for key in (
             "ENERGY_TABLE", "ENPHASE_SYSTEM_ID",
             "ENPHASE_API_KEY", "ENPHASE_ACCESS_TOKEN",
@@ -834,6 +863,360 @@ class TestIngestLambdaHandlerWeather(unittest.TestCase):
         self.assertEqual(body["status"], "ok")
         self.assertNotIn("cloud_cover_pct", body)
         self.assertNotIn("weather_condition", body)
+
+
+# ---------------------------------------------------------------------------
+# _check_rate_limit_block / _set_rate_limit_block
+# ---------------------------------------------------------------------------
+
+@mock_aws
+class TestCircuitBreakerHelpers(unittest.TestCase):
+    """Unit tests for the rate-limit circuit breaker read/write helpers."""
+
+    def setUp(self):
+        ddb = boto3.resource("dynamodb", region_name="us-east-1")
+        ingest._dynamo = ddb
+        self.config_table = _make_config_table(ddb)
+
+    def test_returns_false_when_no_record(self):
+        self.assertFalse(ingest._check_rate_limit_block(self.config_table))
+
+    def test_returns_true_when_block_is_active(self):
+        from datetime import timedelta
+        future = (datetime.now(timezone.utc) + timedelta(hours=12)).isoformat()
+        self.config_table.put_item(Item={
+            "userId": "default",
+            "configType": "enphase_rate_limit",
+            "blocked_until": future,
+            "reason": "429 test",
+        })
+        self.assertTrue(ingest._check_rate_limit_block(self.config_table))
+
+    def test_returns_false_when_block_has_expired(self):
+        from datetime import timedelta
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        self.config_table.put_item(Item={
+            "userId": "default",
+            "configType": "enphase_rate_limit",
+            "blocked_until": past,
+            "reason": "old block",
+        })
+        self.assertFalse(ingest._check_rate_limit_block(self.config_table))
+
+    def test_set_rate_limit_block_writes_future_timestamp(self):
+        ingest._set_rate_limit_block(self.config_table, "429 from /summary")
+        item = self.config_table.get_item(
+            Key={"userId": "default", "configType": "enphase_rate_limit"}
+        )["Item"]
+        self.assertIn("blocked_until", item)
+        self.assertEqual(item["reason"], "429 from /summary")
+        # blocked_until must be in the future
+        blocked_until = datetime.fromisoformat(item["blocked_until"])
+        self.assertGreater(blocked_until, datetime.now(timezone.utc))
+
+    def test_set_then_check_returns_true(self):
+        ingest._set_rate_limit_block(self.config_table, "test")
+        self.assertTrue(ingest._check_rate_limit_block(self.config_table))
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting — _fetch_enphase_summary raises EnphaseRateLimitError on 429
+# ---------------------------------------------------------------------------
+
+class TestEnphase429Handling(unittest.TestCase):
+    """_fetch_enphase_summary raises EnphaseRateLimitError on HTTP 429."""
+
+    def test_429_raises_rate_limit_error(self):
+        from urllib.error import HTTPError
+        err = HTTPError(url="", code=429, msg="Too Many Requests", hdrs=None, fp=None)
+        with patch("ingest_handler.urlopen", side_effect=err):
+            with self.assertRaises(ingest.EnphaseRateLimitError):
+                ingest._fetch_enphase_summary("sys-1", "key", "tok", "cid", "csec")
+
+    def test_429_does_not_attempt_token_refresh(self):
+        from urllib.error import HTTPError
+        err = HTTPError(url="", code=429, msg="Too Many Requests", hdrs=None, fp=None)
+        with patch("ingest_handler.urlopen", side_effect=err), \
+             patch("ingest_handler._refresh_tokens") as mock_refresh:
+            with self.assertRaises(ingest.EnphaseRateLimitError):
+                ingest._fetch_enphase_summary("sys-1", "key", "tok", "cid", "csec")
+        mock_refresh.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# lambda_handler — rate limit / circuit breaker / nighttime / battery throttle
+# ---------------------------------------------------------------------------
+
+def _make_env_with_credentials():
+    os.environ["ENPHASE_SYSTEM_ID"]     = SYSTEM_ID
+    os.environ["ENPHASE_API_KEY"]       = "test-key"
+    os.environ["ENPHASE_ACCESS_TOKEN"]  = "test-token"
+    os.environ["ENPHASE_CLIENT_ID"]     = "test-client"
+    os.environ["ENPHASE_CLIENT_SECRET"] = "test-secret"
+
+
+def _clear_env():
+    for key in (
+        "ENERGY_TABLE", "CONFIG_TABLE", "ENPHASE_SYSTEM_ID",
+        "ENPHASE_API_KEY", "ENPHASE_ACCESS_TOKEN",
+        "ENPHASE_CLIENT_ID", "ENPHASE_CLIENT_SECRET",
+    ):
+        os.environ.pop(key, None)
+
+
+def _fake_datetime_mock(local_hour: int):
+    """Return a mock for `ingest_handler.datetime` pinned to `local_hour` Pacific."""
+    from datetime import datetime as real_datetime
+    from zoneinfo import ZoneInfo
+    pacific = ZoneInfo("America/Los_Angeles")
+    fake_pac = real_datetime(2026, 4, 22, local_hour, 0, tzinfo=pacific)
+    fake_utc = fake_pac.astimezone(timezone.utc)
+
+    def fake_now(tz=None):
+        if tz is not None and getattr(tz, "key", None) == "America/Los_Angeles":
+            return fake_pac
+        return fake_utc
+
+    mock_dt = MagicMock()
+    mock_dt.now.side_effect = fake_now
+    mock_dt.fromisoformat = real_datetime.fromisoformat
+    mock_dt.fromtimestamp = real_datetime.fromtimestamp
+    return mock_dt
+
+
+@mock_aws
+class TestRateLimitCircuitBreaker(unittest.TestCase):
+    """lambda_handler circuit breaker: 429 sets block; active block skips calls."""
+
+    def setUp(self):
+        ddb = boto3.resource("dynamodb", region_name="us-east-1")
+        ingest._dynamo = ddb
+        self.table = _make_table(ddb)
+        self.config_table = _make_config_table(ddb)
+        os.environ["ENERGY_TABLE"]   = TABLE_NAME
+        os.environ["CONFIG_TABLE"]   = CONFIG_TABLE_NAME
+        _make_env_with_credentials()
+
+    def tearDown(self):
+        _clear_env()
+
+    def _fake_summary_response(self):
+        payload = {
+            "current_power": 1000, "energy_today": 5000,
+            "summary_date": "2026-04-22", "last_report_at": 1745280000,
+        }
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = json.dumps(payload).encode()
+        return mock_resp
+
+    def test_429_sets_circuit_breaker_and_returns_rate_limited(self):
+        """When _fetch_enphase_summary gets 429, handler writes block and returns rate_limited."""
+        from urllib.error import HTTPError
+        err = HTTPError(url="", code=429, msg="Too Many Requests", hdrs=None, fp=None)
+
+        with patch("ingest_handler.datetime", _fake_datetime_mock(10)), \
+             patch("ingest_handler.urlopen", side_effect=err):
+            result = ingest.lambda_handler({}, None)
+
+        body = json.loads(result["body"])
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(body["status"], "rate_limited")
+
+        # Circuit breaker record must have been written
+        item = self.config_table.get_item(
+            Key={"userId": "default", "configType": "enphase_rate_limit"}
+        ).get("Item")
+        self.assertIsNotNone(item)
+        blocked_until = datetime.fromisoformat(item["blocked_until"])
+        self.assertGreater(blocked_until, datetime.now(timezone.utc))
+
+        # No energy reading should have been written
+        self.assertEqual(len(self.table.scan()["Items"]), 0)
+
+    def test_active_circuit_breaker_skips_enphase_calls(self):
+        """When circuit breaker is active, no Enphase API calls are made."""
+        from datetime import timedelta
+        future = (datetime.now(timezone.utc) + timedelta(hours=12)).isoformat()
+        self.config_table.put_item(Item={
+            "userId": "default",
+            "configType": "enphase_rate_limit",
+            "blocked_until": future,
+            "reason": "test block",
+        })
+
+        with patch("ingest_handler.datetime", _fake_datetime_mock(10)), \
+             patch("ingest_handler._fetch_enphase_summary") as mock_fetch:
+            result = ingest.lambda_handler({}, None)
+
+        mock_fetch.assert_not_called()
+        body = json.loads(result["body"])
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(body["status"], "rate_limited")
+        self.assertEqual(len(self.table.scan()["Items"]), 0)
+
+    def test_expired_circuit_breaker_allows_normal_flow(self):
+        """When circuit breaker has expired, normal ingest resumes."""
+        # Use a fixed past date so the comparison is stable regardless of mocked time
+        past = "2026-01-01T00:00:00+00:00"
+        self.config_table.put_item(Item={
+            "userId": "default",
+            "configType": "enphase_rate_limit",
+            "blocked_until": past,
+            "reason": "old block",
+        })
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if "battery" in url:
+                payload = {"intervals": [{"soc": {"percent": "70"}}]}
+            else:
+                payload = {
+                    "current_power": 2000, "energy_today": 7000,
+                    "summary_date": "2026-04-22", "last_report_at": 1745280000,
+                }
+            mock_resp = MagicMock()
+            mock_resp.__enter__ = lambda s: s
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            mock_resp.read.return_value = json.dumps(payload).encode()
+            return mock_resp
+
+        # Use hour=8 (divisible by 4) so battery SOC is also fetched
+        with patch("ingest_handler.datetime", _fake_datetime_mock(8)), \
+             patch("ingest_handler.urlopen", side_effect=fake_urlopen):
+            result = ingest.lambda_handler({}, None)
+
+        body = json.loads(result["body"])
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(len(self.table.scan()["Items"]), 1)
+
+
+@mock_aws
+class TestNighttimeSkip(unittest.TestCase):
+    """lambda_handler skips all Enphase API calls outside solar hours (9pm–6am Pacific)."""
+
+    def setUp(self):
+        ddb = boto3.resource("dynamodb", region_name="us-east-1")
+        ingest._dynamo = ddb
+        self.table = _make_table(ddb)
+        os.environ["ENERGY_TABLE"] = TABLE_NAME
+        _make_env_with_credentials()
+
+    def tearDown(self):
+        _clear_env()
+
+    def test_nighttime_hour_returns_skipped(self):
+        """Hour 23 (11pm Pacific) should return skipped_nighttime without any API calls."""
+        with patch("ingest_handler.datetime", _fake_datetime_mock(23)), \
+             patch("ingest_handler._fetch_enphase_summary") as mock_fetch:
+            result = ingest.lambda_handler({}, None)
+
+        mock_fetch.assert_not_called()
+        body = json.loads(result["body"])
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(body["status"], "skipped_nighttime")
+        self.assertEqual(len(self.table.scan()["Items"]), 0)
+
+    def test_early_morning_hour_returns_skipped(self):
+        """Hour 3 (3am Pacific) should also return skipped_nighttime."""
+        with patch("ingest_handler.datetime", _fake_datetime_mock(3)), \
+             patch("ingest_handler._fetch_enphase_summary") as mock_fetch:
+            result = ingest.lambda_handler({}, None)
+
+        mock_fetch.assert_not_called()
+        body = json.loads(result["body"])
+        self.assertEqual(body["status"], "skipped_nighttime")
+
+    def test_boundary_hour_6_runs_normally(self):
+        """Hour 6 (6am) is the first active hour — should attempt ingest."""
+        def fake_urlopen(req, timeout=None):
+            payload = {
+                "current_power": 100, "energy_today": 50,
+                "summary_date": "2026-04-22", "last_report_at": 1745280000,
+            }
+            mock_resp = MagicMock()
+            mock_resp.__enter__ = lambda s: s
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            mock_resp.read.return_value = json.dumps(payload).encode()
+            return mock_resp
+
+        # hour=6 is NOT divisible by 4 (6%4=2), so battery won't be fetched
+        with patch("ingest_handler.datetime", _fake_datetime_mock(6)), \
+             patch("ingest_handler.urlopen", side_effect=fake_urlopen):
+            result = ingest.lambda_handler({}, None)
+
+        body = json.loads(result["body"])
+        self.assertNotEqual(body.get("status"), "skipped_nighttime")
+
+    def test_boundary_hour_21_skips(self):
+        """Hour 21 (9pm) is the first nighttime hour — should skip."""
+        with patch("ingest_handler.datetime", _fake_datetime_mock(21)), \
+             patch("ingest_handler._fetch_enphase_summary") as mock_fetch:
+            result = ingest.lambda_handler({}, None)
+
+        mock_fetch.assert_not_called()
+        body = json.loads(result["body"])
+        self.assertEqual(body["status"], "skipped_nighttime")
+
+
+@mock_aws
+class TestBatterySOCThrottle(unittest.TestCase):
+    """Battery SOC is only fetched when local_hour % 4 == 0."""
+
+    def setUp(self):
+        ddb = boto3.resource("dynamodb", region_name="us-east-1")
+        ingest._dynamo = ddb
+        self.table = _make_table(ddb)
+        os.environ["ENERGY_TABLE"] = TABLE_NAME
+        _make_env_with_credentials()
+
+    def tearDown(self):
+        _clear_env()
+
+    def _fake_summary_urlopen(self, req, timeout=None):
+        payload = {
+            "current_power": 1500, "energy_today": 6000,
+            "summary_date": "2026-04-22", "last_report_at": 1745280000,
+        }
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = json.dumps(payload).encode()
+        return mock_resp
+
+    def test_battery_soc_fetched_on_hour_divisible_by_4(self):
+        with patch("ingest_handler.datetime", _fake_datetime_mock(8)), \
+             patch("ingest_handler.urlopen", side_effect=self._fake_summary_urlopen), \
+             patch("ingest_handler._fetch_battery_soc", return_value=75) as mock_soc:
+            result = ingest.lambda_handler({}, None)
+
+        mock_soc.assert_called_once()
+        body = json.loads(result["body"])
+        self.assertEqual(body["battery_soc_pct"], 75)
+
+    def test_battery_soc_not_fetched_on_non_divisible_hour(self):
+        with patch("ingest_handler.datetime", _fake_datetime_mock(9)), \
+             patch("ingest_handler.urlopen", side_effect=self._fake_summary_urlopen), \
+             patch("ingest_handler._fetch_battery_soc") as mock_soc:
+            result = ingest.lambda_handler({}, None)
+
+        mock_soc.assert_not_called()
+        body = json.loads(result["body"])
+        self.assertIsNone(body["battery_soc_pct"])
+
+    def test_battery_soc_fetched_at_hour_0(self):
+        # Hour 0 is technically nighttime (< 6), so this would be skipped.
+        # Hour 12 is the next divisible-by-4 daytime slot to verify.
+        with patch("ingest_handler.datetime", _fake_datetime_mock(12)), \
+             patch("ingest_handler.urlopen", side_effect=self._fake_summary_urlopen), \
+             patch("ingest_handler._fetch_battery_soc", return_value=60) as mock_soc:
+            result = ingest.lambda_handler({}, None)
+
+        mock_soc.assert_called_once()
+        body = json.loads(result["body"])
+        self.assertEqual(body["battery_soc_pct"], 60)
 
 
 if __name__ == "__main__":

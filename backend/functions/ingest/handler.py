@@ -47,6 +47,10 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 PACIFIC = ZoneInfo("America/Los_Angeles")
 
+
+class EnphaseRateLimitError(Exception):
+    """Raised when Enphase API returns HTTP 429 (rate limit / quota exceeded)."""
+
 # ---------------------------------------------------------------------------
 # AWS clients — created once per Lambda container
 # ---------------------------------------------------------------------------
@@ -200,6 +204,14 @@ def _fetch_enphase_summary(
             logger.info("Access token expired — refreshing and retrying")
             new_token = _refresh_tokens(client_id, client_secret)
             data = _call(new_token)   # let any second failure propagate
+        elif exc.code == 429:
+            logger.warning(
+                "Enphase API rate limit hit (429) — quota exceeded, blocking calls for %dh",
+                _RATE_LIMIT_BLOCK_HOURS,
+            )
+            raise EnphaseRateLimitError(
+                f"429 from /systems/{system_id}/summary"
+            ) from exc
         else:
             body = exc.read().decode()
             logger.error("Enphase API HTTP %s: %s", exc.code, body)
@@ -302,6 +314,41 @@ def _fetch_weather(lat: str, lon: str, api_key: str) -> dict | None:
     except Exception as exc:
         logger.warning("Weather fetch failed (%s) — skipping", exc)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker (Enphase API rate limit)
+# ---------------------------------------------------------------------------
+
+_RATE_LIMIT_USER_ID     = "default"
+_RATE_LIMIT_CONFIG_KEY  = "enphase_rate_limit"
+_RATE_LIMIT_BLOCK_HOURS = 24
+
+
+def _check_rate_limit_block(config_table) -> bool:
+    """Return True if Enphase API calls should be skipped due to an active rate-limit block."""
+    resp = config_table.get_item(
+        Key={"userId": _RATE_LIMIT_USER_ID, "configType": _RATE_LIMIT_CONFIG_KEY}
+    )
+    if "Item" not in resp:
+        return False
+    blocked_until = datetime.fromisoformat(resp["Item"]["blocked_until"])
+    return datetime.now(timezone.utc) < blocked_until
+
+
+def _set_rate_limit_block(config_table, reason: str) -> None:
+    """Write a rate-limit block record that expires in _RATE_LIMIT_BLOCK_HOURS hours."""
+    blocked_until = datetime.now(timezone.utc) + timedelta(hours=_RATE_LIMIT_BLOCK_HOURS)
+    config_table.put_item(Item={
+        "userId":        _RATE_LIMIT_USER_ID,
+        "configType":    _RATE_LIMIT_CONFIG_KEY,
+        "blocked_until": blocked_until.isoformat(),
+        "reason":        reason,
+    })
+    logger.warning(
+        "Enphase API rate-limit block set until %s (reason: %s)",
+        blocked_until.isoformat(), reason,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -487,12 +534,43 @@ def lambda_handler(event: dict, context) -> dict:
         logger.warning("[%s] Credentials not configured: %s — skipping", now, exc)
         return {"statusCode": 200, "body": json.dumps({"ingested_at": now, "status": "skipped"})}
 
+    # Nighttime skip: solar produces nothing 9pm–6am Pacific; skip to conserve API quota.
+    local_hour = datetime.now(PACIFIC).hour
+    if local_hour < 6 or local_hour >= 21:
+        logger.info("Skipping Enphase API call outside solar hours (hour=%d)", local_hour)
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"ingested_at": now, "status": "skipped_nighttime"}),
+        }
+
+    config_table_name = os.environ.get("CONFIG_TABLE", "")
+    config_table = _dynamo.Table(config_table_name) if config_table_name else None
+
+    # Circuit breaker: skip all Enphase calls if we recently hit a 429.
+    if config_table:
+        try:
+            if _check_rate_limit_block(config_table):
+                logger.info(
+                    "Enphase API rate-limited — skipping until block expires"
+                )
+                return {
+                    "statusCode": 200,
+                    "body": json.dumps({"ingested_at": now, "status": "rate_limited"}),
+                }
+        except Exception as exc:
+            logger.warning("Rate limit check failed (%s) — proceeding", exc)
+
     try:
         summary = _fetch_enphase_summary(
             system_id, api_key, access_token, client_id, client_secret
         )
-        # Fetch battery SOC (non-fatal if it fails)
-        battery_soc_pct = _fetch_battery_soc(system_id, api_key, access_token)
+        # Battery SOC: only fetch every 4 hours — it changes slowly and each call costs quota.
+        battery_soc_pct = None
+        if local_hour % 4 == 0:
+            battery_soc_pct = _fetch_battery_soc(system_id, api_key, access_token)
+        else:
+            logger.debug("Skipping battery SOC fetch (hour=%d, not divisible by 4)", local_hour)
+
         # Fetch weather (non-fatal if not configured or fails)
         owm_key = _resolve_owm_api_key()
         lat = os.environ.get("LOCATION_LAT", "")
@@ -503,14 +581,25 @@ def lambda_handler(event: dict, context) -> dict:
         _write_reading(table, system_id, summary, battery_soc_pct=battery_soc_pct, weather=weather)
 
         # Alert if battery full and solar is being curtailed
-        ntfy_topic   = _resolve_ntfy_topic()
-        config_table = _dynamo.Table(os.environ.get("CONFIG_TABLE", ""))
-        if ntfy_topic and _should_send_curtailment_alert(
+        ntfy_topic = _resolve_ntfy_topic()
+        if ntfy_topic and config_table and _should_send_curtailment_alert(
             battery_soc_pct, summary.get("current_power", 0), config_table
         ):
             _send_curtailment_alert(
                 ntfy_topic, battery_soc_pct, summary.get("current_power", 0), config_table
             )
+
+    except EnphaseRateLimitError as exc:
+        logger.warning("Enphase API rate limit hit — blocking calls for %dh", _RATE_LIMIT_BLOCK_HOURS)
+        if config_table:
+            try:
+                _set_rate_limit_block(config_table, str(exc))
+            except Exception as write_exc:
+                logger.error("Failed to write rate limit block: %s", write_exc)
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"ingested_at": now, "status": "rate_limited"}),
+        }
     except Exception as exc:
         logger.exception("Enphase ingest failed: %s", exc)
         return {
