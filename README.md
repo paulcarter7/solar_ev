@@ -1,8 +1,8 @@
 # Home Energy Optimizer
 
-A personal web app that decides **when to charge your EV** by combining real-time home solar production, home battery state, and time-of-use electricity rates.
+A personal web app that decides **when to charge your EV** by combining real-time home solar production, home battery state, and time-of-use electricity rates. It also lets you ask natural-language questions about your energy setup using a built-in AI chat backed by RAG (retrieval-augmented generation).
 
-Data flows hourly from an Enphase inverter into DynamoDB. The frontend visualises today's solar production and recommends the cheapest charging window — factoring in whether you can run primarily on solar, stored battery energy, or grid power.
+Data flows hourly from an Enphase inverter into DynamoDB. The frontend visualises today's solar production and recommends the cheapest charging window — factoring in whether you can run primarily on solar, stored battery energy, or grid power. The chat panel answers questions from uploaded documents (rate schedules, equipment manuals) using AWS Bedrock and a pgvector similarity search.
 
 **Hardware:** Enphase inverter · 4 × Enphase IQ Battery 5P (20 kWh) · 2026 BMW iX 45 (76.6 kWh, 7.2–11 kW AC)
 **Utility:** PG&E / MCE, rate E-TOU-C (see [Rate schedule](#rate-schedule) below)
@@ -16,7 +16,9 @@ Data flows hourly from an Enphase inverter into DynamoDB. The frontend visualise
 | Frontend | React 18 + Vite + Tailwind CSS + Recharts |
 | Backend | Python 3.12 AWS Lambda functions |
 | API | AWS API Gateway (Lambda proxy) |
-| Database | DynamoDB |
+| Database | DynamoDB (time-series readings), Neon serverless Postgres + pgvector (document embeddings) |
+| AI / embeddings | AWS Bedrock — Amazon Titan Text Embeddings V2 + Amazon Nova Lite |
+| Document storage | S3 (PDF upload triggers auto-ingest) |
 | Scheduler | EventBridge (hourly cron → ingest Lambda) |
 | Secrets | AWS SSM Parameter Store (SecureString) |
 | Infrastructure | AWS CDK (TypeScript) |
@@ -30,13 +32,19 @@ solar_ev/
 ├── frontend/                   # React app (Vite + Tailwind + Recharts)
 │   └── src/
 │       ├── App.tsx             # Main dashboard component
-│       └── api/solar.ts        # Typed API client
+│       ├── api/
+│       │   ├── solar.ts        # Typed API client (solar + recommendation)
+│       │   └── chat.ts         # POST /chat API client
+│       └── components/
+│           └── ChatPanel.tsx   # AI chat UI with source citations
 ├── backend/
 │   ├── functions/
 │   │   ├── solar_data/         # GET /solar/today
 │   │   ├── recommendation/     # GET /recommendation
-│   │   └── ingest/             # Hourly cron — fetches Enphase + writes DynamoDB
-│   ├── shared/                 # Shared Python utilities (api_response, etc.)
+│   │   ├── ingest/             # Hourly cron — fetches Enphase + writes DynamoDB
+│   │   ├── doc_ingest/         # S3 trigger — PDF → chunks → Bedrock → pgvector
+│   │   └── rag_query/          # POST /chat — pgvector retrieval → Nova Lite generation
+│   ├── shared/                 # Shared Python utilities (api_response, neon, etc.)
 │   ├── tests/                  # Unit tests (pytest + moto)
 │   └── local_server.py         # Zero-dependency local dev server (port 3001)
 └── infra/                      # AWS CDK stack — all resources in one file
@@ -68,6 +76,26 @@ The app uses the **PG&E E-TOU-C** time-of-use rate (Pacific time). All hours in 
    - **Solar + Home Battery** — ≥ 70% solar-covered and battery ≥ 60%, *or* battery ≥ 80% with ≥ 30% solar
    - **Home Battery (avoid peak)** — battery ≥ 60% and the best window falls in peak hours
    - **Grid** — all other cases, labelled with the rate period
+
+---
+
+## AI document chat
+
+The dashboard includes a chat panel that answers questions from documents you upload (rate plan PDFs, equipment manuals, NEM 3.0 summaries, etc.).
+
+**How it works:**
+
+1. Upload a PDF to the S3 documents bucket (printed as `DocumentsBucketName` in CDK deploy output).
+2. An S3 event triggers the `doc_ingest` Lambda, which extracts page text, splits it into overlapping 500-word chunks, embeds each chunk with Bedrock Titan Text Embeddings V2, and stores them in Neon pgvector.
+3. When you ask a question in the chat panel, the `rag_query` Lambda embeds your query, retrieves the 5 closest chunks by cosine distance, and generates an answer with Amazon Nova Lite. Each response includes source citations with document name and page number.
+
+**Uploading a document:**
+```bash
+aws s3 cp your-rate-schedule.pdf s3://<DocumentsBucketName>/your-rate-schedule.pdf
+```
+Re-uploading the same key re-ingests the document (old chunks are deleted first).
+
+**Local dev:** Set `NEON_CONNECTION_STRING` in `backend/.env` to skip SSM lookup. The `doc_ingest` and `rag_query` handlers are available via POST `/api/chat` on the local server. Note: pg8000 must be installed (`pip install pg8000 pypdf`) for these routes to load.
 
 ---
 
@@ -158,7 +186,7 @@ pytest tests/ -v
 
 All AWS calls are mocked with `moto` — no credentials or live infrastructure needed.
 
-Covered: `solar_data`, `recommendation`, and `ingest` Lambda handlers (including SSM helpers, OAuth token refresh, Enphase API calls, battery SOC, OpenWeatherMap fetch, curtailment alert logic) plus shared utilities.
+Covered: `solar_data`, `recommendation`, `ingest`, `doc_ingest`, and `rag_query` Lambda handlers (including SSM helpers, OAuth token refresh, Enphase API calls, battery SOC, OpenWeatherMap fetch, curtailment alert logic, PDF chunking with page tracking, pgvector retrieval, and Bedrock generation) plus shared utilities.
 
 ### Frontend (TypeScript — Vitest + Testing Library)
 
@@ -225,6 +253,20 @@ aws ssm put-parameter --region $REGION --type SecureString \
 ```
 
 If the parameter is absent, weather fetching is silently skipped — ingest continues normally.
+
+### Store Neon connection string in SSM (required for AI chat)
+
+Create a free Postgres database at [neon.tech](https://neon.tech) (pgvector is pre-installed). Store the connection string:
+
+```bash
+aws ssm put-parameter --region $REGION --type SecureString \
+  --name /solar-ev/neon-connection-string \
+  --value 'postgresql://user:password@host/dbname?sslmode=require'
+```
+
+> Use **single quotes** around the value to prevent the shell from interpreting special characters in the password.
+
+The `doc_ingest` Lambda creates the `document_chunks` table and HNSW index on first run — no manual schema migration needed.
 
 ### Curtailment alerts via ntfy.sh (optional)
 
@@ -371,8 +413,10 @@ print(json.dumps(handler.lambda_handler({}, None), indent=2))
 
 | Feature | Where to start |
 |---------|---------------|
+| Text-to-query over DynamoDB | New Lambda: translate natural language → DynamoDB query → return tabular data; route via chat |
+| Combined chat routing | Router Lambda that classifies query as "document lookup" vs. "data query" and delegates accordingly |
+| Anomaly detection + LLM explanation | Flag unusual production/consumption in ingest Lambda; store anomalies; surface in chat |
 | Weather-adjusted solar forecast | Use `cloud_cover_pct` already stored per hour — adjust solar estimate in `recommendation` handler |
-| Historical trend charts | Add date-range DynamoDB query to `solar_data`; new Recharts component |
 | User config (custom charge rate, schedule prefs) | `backend/functions/recommendation/handler.py` + `solar-ev-user-config` table |
 | EV charger scheduling | Enphase EVSE API requires a higher API tier; alternative: Home Assistant integration |
 | Host frontend on S3 + CloudFront | Add `S3Bucket` + `CloudFrontDistribution` to CDK stack |
