@@ -13,6 +13,7 @@ import type { SolarTodayResponse, RecommendationResponse, HistoryResponse, Weath
 import { SolarChart } from "./components/SolarChart";
 import { TouTimeline } from "./components/TouTimeline";
 import { RecommendationCard } from "./components/RecommendationCard";
+import ChatPanel from "./components/ChatPanel";
 
 function weatherIcon(condition: string): string {
   switch (condition) {
@@ -322,6 +323,9 @@ export default function App() {
                 </div>
               </section>
             )}
+
+            {/* Energy docs chat */}
+            <ChatPanel />
 
             {/* Alternate windows table */}
             <section className="rounded-2xl bg-gray-800 border border-gray-700 p-5 space-y-3">

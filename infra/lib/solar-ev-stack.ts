@@ -6,6 +6,8 @@ import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as logs from "aws-cdk-lib/aws-logs";
+import * as s3 from "aws-cdk-lib/aws-s3";
+import * as s3n from "aws-cdk-lib/aws-s3-notifications";
 import { Construct } from "constructs";
 import * as path from "path";
 
@@ -187,6 +189,128 @@ export class SolarEvStack extends cdk.Stack {
     });
 
     // -------------------------------------------------------------------------
+    // S3: document storage for RAG ingestion
+    // -------------------------------------------------------------------------
+    const documentsBucket = new s3.Bucket(this, "DocumentsBucket", {
+      bucketName: `solar-ev-documents-${this.account}-${this.region}`,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+    });
+
+    // -------------------------------------------------------------------------
+    // Shared IAM policies for RAG Lambdas
+    // -------------------------------------------------------------------------
+    // Bedrock is unavailable in us-west-1 — Lambdas call it cross-region via us-east-1.
+    // Newer Claude models require inference profiles (us.*) rather than direct model IDs.
+    const BEDROCK_REGION = "us-east-1";
+    const bedrockPolicy = new iam.PolicyStatement({
+      actions: ["bedrock:InvokeModel"],
+      resources: [
+        // Titan embeddings (foundation model, no account ID)
+        `arn:aws:bedrock:${BEDROCK_REGION}::foundation-model/amazon.titan-embed-text-v2:0`,
+        // Nova Lite cross-region inference profile
+        `arn:aws:bedrock:${BEDROCK_REGION}:${this.account}:inference-profile/us.amazon.nova-lite-v1:0`,
+        `arn:aws:bedrock:${BEDROCK_REGION}::foundation-model/us.amazon.nova-lite-v1:0`,
+        `arn:aws:bedrock:*::foundation-model/amazon.nova-lite-v1:0`,
+      ],
+    });
+
+    const neonSsmPolicy = new iam.PolicyStatement({
+      actions: ["ssm:GetParameter"],
+      resources: [
+        `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_PREFIX}/neon-connection-string`,
+      ],
+    });
+
+    // pg8000 and pypdf are pure Python — no Docker needed for bundling.
+    // Local bundling: pip installs deps, copies handler files, copies shared/neon.py.
+    // Falls back to Docker if local pip isn't available (unlikely on a dev machine).
+    const sharedDir = path.join(__dirname, "../../backend/shared");
+    const bundleFn = (fnDir: string): cdk.BundlingOptions => ({
+      image: lambda.Runtime.PYTHON_3_12.bundlingImage,
+      local: {
+        tryBundle(outputDir: string): boolean {
+          try {
+            const { execSync } = require("child_process");
+            execSync(
+              `pip install -r "${path.join(fnDir, "requirements.txt")}" -t "${outputDir}" --quiet`,
+              { stdio: ["ignore", "inherit", "inherit"] }
+            );
+            execSync(`cp -r "${fnDir}/." "${outputDir}/"`, { stdio: "inherit" });
+            execSync(`cp "${path.join(sharedDir, "neon.py")}" "${outputDir}/"`, { stdio: "inherit" });
+            return true;
+          } catch (e) {
+            return false;
+          }
+        },
+      },
+      command: [
+        "bash",
+        "-c",
+        `pip install -r requirements.txt -t /asset-output --quiet && cp -au . /asset-output`,
+      ],
+    });
+
+    const ragEnv = {
+      NEON_CONNECTION_STRING_PARAM: `${SSM_PREFIX}/neon-connection-string`,
+      BEDROCK_REGION: BEDROCK_REGION,
+      BEDROCK_EMBEDDING_MODEL: "amazon.titan-embed-text-v2:0",
+    };
+
+    // -------------------------------------------------------------------------
+    // Lambda: doc_ingest — S3 PDF → Bedrock Titan embeddings → Neon pgvector
+    // -------------------------------------------------------------------------
+    const docIngestDir = path.join(__dirname, "../../backend/functions/doc_ingest");
+    const docIngestFn = new lambda.Function(this, "DocIngestFn", {
+      functionName: "solar-ev-doc-ingest",
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: "handler.lambda_handler",
+      code: lambda.Code.fromAsset(docIngestDir, { bundling: bundleFn(docIngestDir) }),
+      environment: {
+        ...ragEnv,
+        DOCUMENTS_BUCKET: documentsBucket.bucketName,
+      },
+      timeout: cdk.Duration.seconds(300),
+      memorySize: 512,
+      logRetention: logs.RetentionDays.ONE_MONTH,
+      description: "Ingests PDF docs from S3 into Neon pgvector via Bedrock embeddings",
+    });
+
+    documentsBucket.grantRead(docIngestFn);
+    docIngestFn.addToRolePolicy(bedrockPolicy);
+    docIngestFn.addToRolePolicy(neonSsmPolicy);
+
+    // Trigger ingestion whenever a .pdf is uploaded
+    documentsBucket.addEventNotification(
+      s3.EventType.OBJECT_CREATED,
+      new s3n.LambdaDestination(docIngestFn),
+      { suffix: ".pdf" }
+    );
+
+    // -------------------------------------------------------------------------
+    // Lambda: rag_query — query → pgvector similarity search → Bedrock Claude
+    // -------------------------------------------------------------------------
+    const ragQueryDir = path.join(__dirname, "../../backend/functions/rag_query");
+    const ragQueryFn = new lambda.Function(this, "RagQueryFn", {
+      functionName: "solar-ev-rag-query",
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: "handler.lambda_handler",
+      code: lambda.Code.fromAsset(ragQueryDir, { bundling: bundleFn(ragQueryDir) }),
+      environment: {
+        ...ragEnv,
+        BEDROCK_GENERATION_MODEL: "us.amazon.nova-lite-v1:0",
+      },
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 256,
+      logRetention: logs.RetentionDays.ONE_MONTH,
+      description: "Answers natural language queries via RAG over ingested documents",
+    });
+
+    ragQueryFn.addToRolePolicy(bedrockPolicy);
+    ragQueryFn.addToRolePolicy(neonSsmPolicy);
+
+    // -------------------------------------------------------------------------
     // API Gateway
     // -------------------------------------------------------------------------
     const api = new apigateway.RestApi(this, "SolarEvApi", {
@@ -228,6 +352,13 @@ export class SolarEvStack extends cdk.Stack {
       new apigateway.LambdaIntegration(recommendationFn, { proxy: true })
     );
 
+    // POST /chat
+    const chat = api.root.addResource("chat");
+    chat.addMethod(
+      "POST",
+      new apigateway.LambdaIntegration(ragQueryFn, { proxy: true })
+    );
+
     // -------------------------------------------------------------------------
     // Outputs
     // -------------------------------------------------------------------------
@@ -245,6 +376,11 @@ export class SolarEvStack extends cdk.Stack {
     new cdk.CfnOutput(this, "ConfigTableName", {
       value: configTable.tableName,
       description: "DynamoDB user config table",
+    });
+
+    new cdk.CfnOutput(this, "DocumentsBucketName", {
+      value: documentsBucket.bucketName,
+      description: "S3 bucket for RAG document ingestion — upload PDFs here",
     });
   }
 }

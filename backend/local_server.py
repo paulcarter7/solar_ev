@@ -64,10 +64,10 @@ def _load_handler_from_file(file_path: str, unique_module_name: str, attr: str =
     return getattr(mod, attr)
 
 
-# Route table: path → handler callable (loaded once at startup)
-def _build_routes() -> dict:
+# Route tables: path → handler callable (loaded once at startup)
+def _build_routes() -> tuple[dict, dict]:
     fn_dir = os.path.join(BASE_DIR, "functions")
-    return {
+    get_routes = {
         "/solar/today":   _load_handler_from_file(
             os.path.join(fn_dir, "solar_data", "handler.py"),
             "solar_data_handler",
@@ -81,6 +81,18 @@ def _build_routes() -> dict:
             "recommendation_handler",
         ),
     }
+    try:
+        post_routes = {
+            "/chat": _load_handler_from_file(
+                os.path.join(fn_dir, "rag_query", "handler.py"),
+                "rag_query_handler",
+            ),
+        }
+    except Exception as exc:
+        print(f"  Warning: could not load rag_query handler ({exc})")
+        print("  Install pg8000 to enable POST /chat locally.")
+        post_routes = {}
+    return get_routes, post_routes
 
 
 PORT = int(os.environ.get("LOCAL_PORT", "3001"))
@@ -88,6 +100,7 @@ PORT = int(os.environ.get("LOCAL_PORT", "3001"))
 
 class DevHandler(BaseHTTPRequestHandler):
     routes: dict = {}
+    post_routes: dict = {}
 
     def log_message(self, fmt, *args):  # noqa: ARG002  quieter logs
         status = args[1] if len(args) > 1 else "?"
@@ -106,6 +119,35 @@ class DevHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self._send(200, {})
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        content_length = int(self.headers.get("Content-Length", 0))
+        raw_body = self.rfile.read(content_length) if content_length else b"{}"
+
+        handler_fn = self.post_routes.get(parsed.path)
+        if handler_fn is None:
+            self._send(404, {"error": f"No route for POST {parsed.path}"})
+            return
+
+        event = {
+            "httpMethod": "POST",
+            "path": parsed.path,
+            "queryStringParameters": None,
+            "headers": {"Content-Type": self.headers.get("Content-Type", "application/json")},
+            "body": raw_body.decode("utf-8"),
+            "isBase64Encoded": False,
+        }
+
+        try:
+            result = handler_fn(event, None)
+            body = result.get("body", "{}")
+            body = json.loads(body) if isinstance(body, str) else body
+            self._send(result.get("statusCode", 200), body)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            self._send(500, {"error": str(exc)})
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -141,11 +183,13 @@ class DevHandler(BaseHTTPRequestHandler):
 def main():
     _load_dotenv()
     print("Loading route handlers...")
-    DevHandler.routes = _build_routes()
+    DevHandler.routes, DevHandler.post_routes = _build_routes()
     print(f"Local API server running on http://localhost:{PORT}")
-    print(f"  GET /solar/today")
-    print(f"  GET /solar/history?days=14")
-    print(f"  GET /recommendation?current_soc=0.3&target_soc=0.8")
+    print(f"  GET  /solar/today")
+    print(f"  GET  /solar/history?days=14")
+    print(f"  GET  /recommendation?current_soc=0.3&target_soc=0.8")
+    if DevHandler.post_routes:
+        print(f"  POST /chat")
     print(f"  Ctrl-C to stop\n")
     server = HTTPServer(("localhost", PORT), DevHandler)
     try:
