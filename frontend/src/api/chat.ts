@@ -1,4 +1,4 @@
-const API_BASE = import.meta.env.VITE_API_URL ?? "";
+const BASE_URL = (import.meta.env.VITE_API_URL as string | undefined) ?? "/api";
 
 export interface ChatResponse {
   response: string;
@@ -6,7 +6,7 @@ export interface ChatResponse {
 }
 
 export async function sendChatMessage(query: string): Promise<ChatResponse> {
-  const res = await fetch(`${API_BASE}/api/chat`, {
+  const res = await fetch(`${BASE_URL}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ query }),
