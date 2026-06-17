@@ -142,14 +142,41 @@ class TestLambdaHandler(unittest.TestCase):
         self.assertIsInstance(body["sources"], list)
         self.assertEqual(len(body["sources"]), len(FAKE_CHUNKS))
 
-    def test_no_chunks_still_returns_200(self):
+    def test_no_chunks_returns_off_topic_response(self):
         mocks = self._setup_mocks(chunks=[])
         with mocks[0], mocks[1], mocks[2], mocks[3], mocks[4]:
-            result = rag_query.lambda_handler(_event({"query": "Anything?"}), None)
+            result = rag_query.lambda_handler(_event({"query": "What is the capital of France?"}), None)
 
         self.assertEqual(result["statusCode"], 200)
         body = json.loads(result["body"])
         self.assertEqual(body["sources"], [])
+        self.assertIn("only answer questions", body["response"])
+
+    def test_high_distance_chunks_returns_off_topic_response(self):
+        # Distance above threshold — query is unrelated to documents
+        far_chunks = [
+            {"doc_name": "pge-rate.pdf", "content": "Some content.", "page_start": 1, "distance": 0.9},
+        ]
+        mocks = self._setup_mocks(chunks=far_chunks)
+        with mocks[0], mocks[1], mocks[2], mocks[3], mocks[4]:
+            result = rag_query.lambda_handler(_event({"query": "Who won the World Cup?"}), None)
+
+        self.assertEqual(result["statusCode"], 200)
+        body = json.loads(result["body"])
+        self.assertIn("only answer questions", body["response"])
+
+    def test_within_threshold_proceeds_to_generation(self):
+        # Distance below threshold — should generate a real answer
+        close_chunks = [
+            {"doc_name": "pge-rate.pdf", "content": "Super off-peak is 9am–2pm.", "page_start": 3, "distance": 0.3},
+        ]
+        mocks = self._setup_mocks(chunks=close_chunks)
+        with mocks[0], mocks[1], mocks[2], mocks[3], mocks[4]:
+            result = rag_query.lambda_handler(_event({"query": "When is super off-peak?"}), None)
+
+        self.assertEqual(result["statusCode"], 200)
+        body = json.loads(result["body"])
+        self.assertEqual(body["response"], "Here is the answer.")
 
     def test_bedrock_client_error_returns_502(self):
         from botocore.exceptions import ClientError

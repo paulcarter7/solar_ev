@@ -32,6 +32,9 @@ _bedrock = boto3.client("bedrock-runtime", region_name=os.environ.get("BEDROCK_R
 _ssm_cache: dict[str, str] = {}
 
 TOP_K = 5
+# Cosine distance above this means the query is unrelated to anything in the documents.
+# Range is 0 (identical) to 2 (opposite). 0.7 is a practical cutoff for off-topic queries.
+RELEVANCE_THRESHOLD = float(os.environ.get("RELEVANCE_THRESHOLD", "0.7"))
 
 SYSTEM_PROMPT = (
     "You are an energy advisor assistant for a home solar, battery, and EV charging system. "
@@ -136,14 +139,26 @@ def lambda_handler(event: dict, context) -> dict:
         conn = neon.get_connection(dsn)
         chunks = _retrieve_chunks(conn, query_embedding)
 
-        if chunks:
+        if not chunks or chunks[0]["distance"] > RELEVANCE_THRESHOLD:
             logger.info(
-                "Retrieved %d chunks (closest distance: %.4f)",
-                len(chunks),
-                chunks[0]["distance"],
+                "Query rejected — best distance %.4f exceeds threshold %.4f",
+                chunks[0]["distance"] if chunks else float("inf"),
+                RELEVANCE_THRESHOLD,
             )
-        else:
-            logger.info("No chunks found for query")
+            return {
+                "statusCode": 200,
+                "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"},
+                "body": json.dumps({
+                    "response": "I can only answer questions about your energy system and uploaded documents.",
+                    "sources": [],
+                }),
+            }
+
+        logger.info(
+            "Retrieved %d chunks (closest distance: %.4f)",
+            len(chunks),
+            chunks[0]["distance"],
+        )
 
         generation_model = os.environ.get(
             "BEDROCK_GENERATION_MODEL",
