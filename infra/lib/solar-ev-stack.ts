@@ -360,6 +360,37 @@ export class SolarEvStack extends cdk.Stack {
     );
 
     // -------------------------------------------------------------------------
+    // Lambda: data_query — natural language → DynamoDB query → formatted answer
+    // -------------------------------------------------------------------------
+    const dataQueryFn = new lambda.Function(this, "DataQueryFn", {
+      functionName: "solar-ev-data-query",
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: "handler.lambda_handler",
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, "../../backend/functions/data_query")
+      ),
+      environment: {
+        ...sharedEnv,
+        BEDROCK_REGION: BEDROCK_REGION,
+        BEDROCK_GENERATION_MODEL: "us.amazon.nova-lite-v1:0",
+      },
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 256,
+      logRetention: logs.RetentionDays.ONE_MONTH,
+      description: "Answers natural language questions about energy data in DynamoDB",
+    });
+
+    energyTable.grantReadData(dataQueryFn);
+    dataQueryFn.addToRolePolicy(bedrockPolicy);
+
+    // POST /data-query
+    const dataQuery = api.root.addResource("data-query");
+    dataQuery.addMethod(
+      "POST",
+      new apigateway.LambdaIntegration(dataQueryFn, { proxy: true })
+    );
+
+    // -------------------------------------------------------------------------
     // Outputs
     // -------------------------------------------------------------------------
     new cdk.CfnOutput(this, "ApiUrl", {

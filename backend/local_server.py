@@ -81,17 +81,25 @@ def _build_routes() -> tuple[dict, dict]:
             "recommendation_handler",
         ),
     }
+    post_routes = {}
+
     try:
-        post_routes = {
-            "/chat": _load_handler_from_file(
-                os.path.join(fn_dir, "rag_query", "handler.py"),
-                "rag_query_handler",
-            ),
-        }
+        post_routes["/chat"] = _load_handler_from_file(
+            os.path.join(fn_dir, "rag_query", "handler.py"),
+            "rag_query_handler",
+        )
     except Exception as exc:
         print(f"  Warning: could not load rag_query handler ({exc})")
         print("  Install pg8000 to enable POST /chat locally.")
-        post_routes = {}
+
+    try:
+        post_routes["/data-query"] = _load_handler_from_file(
+            os.path.join(fn_dir, "data_query", "handler.py"),
+            "data_query_handler",
+        )
+    except Exception as exc:
+        print(f"  Warning: could not load data_query handler ({exc})")
+
     return get_routes, post_routes
 
 
@@ -188,8 +196,8 @@ def main():
     print(f"  GET  /solar/today")
     print(f"  GET  /solar/history?days=14")
     print(f"  GET  /recommendation?current_soc=0.3&target_soc=0.8")
-    if DevHandler.post_routes:
-        print(f"  POST /chat")
+    for path in DevHandler.post_routes:
+        print(f"  POST {path}")
     print(f"  Ctrl-C to stop\n")
     server = HTTPServer(("localhost", PORT), DevHandler)
     try:
