@@ -366,41 +366,6 @@ export class SolarEvStack extends cdk.Stack {
     );
 
     // -------------------------------------------------------------------------
-    // Lambda: chat — classifies query and routes to rag_query or data_query
-    // -------------------------------------------------------------------------
-    const chatFn = new lambda.Function(this, "ChatFn", {
-      functionName: "solar-ev-chat",
-      runtime: lambda.Runtime.PYTHON_3_12,
-      handler: "handler.lambda_handler",
-      code: lambda.Code.fromAsset(
-        path.join(__dirname, "../../backend/functions/chat")
-      ),
-      environment: {
-        BEDROCK_REGION: BEDROCK_REGION,
-        BEDROCK_GENERATION_MODEL: "us.amazon.nova-lite-v1:0",
-        RAG_QUERY_FUNCTION_NAME: ragQueryFn.functionName,
-        DATA_QUERY_FUNCTION_NAME: dataQueryFn.functionName,
-        ANOMALY_QUERY_FUNCTION_NAME: anomalyQueryFn.functionName,
-      },
-      timeout: cdk.Duration.seconds(60),
-      memorySize: 256,
-      logRetention: logs.RetentionDays.ONE_MONTH,
-      description: "Routes chat queries to rag_query (documents) or data_query (DynamoDB)",
-    });
-
-    chatFn.addToRolePolicy(bedrockPolicy);
-    ragQueryFn.grantInvoke(chatFn);
-    dataQueryFn.grantInvoke(chatFn);
-    anomalyQueryFn.grantInvoke(chatFn);
-
-    // POST /chat
-    const chatResource = api.root.addResource("chat");
-    chatResource.addMethod(
-      "POST",
-      new apigateway.LambdaIntegration(chatFn, { proxy: true })
-    );
-
-    // -------------------------------------------------------------------------
     // Lambda: data_query — natural language → DynamoDB query → formatted answer
     // -------------------------------------------------------------------------
     const dataQueryFn = new lambda.Function(this, "DataQueryFn", {
@@ -461,6 +426,41 @@ export class SolarEvStack extends cdk.Stack {
     anomalies.addMethod(
       "POST",
       new apigateway.LambdaIntegration(anomalyQueryFn, { proxy: true })
+    );
+
+    // -------------------------------------------------------------------------
+    // Lambda: chat — classifies query and routes to rag_query, data_query, or anomaly_query
+    // -------------------------------------------------------------------------
+    const chatFn = new lambda.Function(this, "ChatFn", {
+      functionName: "solar-ev-chat",
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: "handler.lambda_handler",
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, "../../backend/functions/chat")
+      ),
+      environment: {
+        BEDROCK_REGION: BEDROCK_REGION,
+        BEDROCK_GENERATION_MODEL: "us.amazon.nova-lite-v1:0",
+        RAG_QUERY_FUNCTION_NAME: ragQueryFn.functionName,
+        DATA_QUERY_FUNCTION_NAME: dataQueryFn.functionName,
+        ANOMALY_QUERY_FUNCTION_NAME: anomalyQueryFn.functionName,
+      },
+      timeout: cdk.Duration.seconds(60),
+      memorySize: 256,
+      logRetention: logs.RetentionDays.ONE_MONTH,
+      description: "Routes chat queries to rag_query (documents), data_query, or anomaly_query",
+    });
+
+    chatFn.addToRolePolicy(bedrockPolicy);
+    ragQueryFn.grantInvoke(chatFn);
+    dataQueryFn.grantInvoke(chatFn);
+    anomalyQueryFn.grantInvoke(chatFn);
+
+    // POST /chat
+    const chatResource = api.root.addResource("chat");
+    chatResource.addMethod(
+      "POST",
+      new apigateway.LambdaIntegration(chatFn, { proxy: true })
     );
 
     // -------------------------------------------------------------------------
