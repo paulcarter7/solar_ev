@@ -1,8 +1,8 @@
 # Home Energy Optimizer
 
-A personal web app that decides **when to charge your EV** by combining real-time home solar production, home battery state, and time-of-use electricity rates. It also lets you ask natural-language questions about your energy setup using a built-in AI chat backed by RAG (retrieval-augmented generation).
+A personal web app that decides **when to charge your EV** by combining real-time home solar production, home battery state, and time-of-use electricity rates. A built-in AI chat panel lets you ask natural-language questions about your energy system — covering uploaded documents, historical DynamoDB readings, and automatically detected anomalies.
 
-Data flows hourly from an Enphase inverter into DynamoDB. The frontend visualises today's solar production and recommends the cheapest charging window — factoring in whether you can run primarily on solar, stored battery energy, or grid power. The chat panel answers questions from uploaded documents (rate schedules, equipment manuals) using AWS Bedrock and a pgvector similarity search.
+Data flows hourly from an Enphase inverter into DynamoDB. The frontend visualises today's solar production and recommends the cheapest charging window — factoring in whether you can run primarily on solar, stored battery energy, or grid power. A chat router (Amazon Nova Lite) classifies each question and delegates to one of three specialised Lambda handlers: document RAG (pgvector + Bedrock), data queries (structured DynamoDB), or anomaly summaries (rule-based detection + LLM narrative).
 
 **Hardware:** Enphase inverter · 4 × Enphase IQ Battery 5P (20 kWh) · 2026 BMW iX 45 (76.6 kWh, 7.2–11 kW AC)
 **Utility:** PG&E / MCE, rate E-TOU-C (see [Rate schedule](#rate-schedule) below)
@@ -41,9 +41,12 @@ solar_ev/
 │   ├── functions/
 │   │   ├── solar_data/         # GET /solar/today
 │   │   ├── recommendation/     # GET /recommendation
-│   │   ├── ingest/             # Hourly cron — fetches Enphase + writes DynamoDB
+│   │   ├── ingest/             # Hourly cron — fetches Enphase + writes DynamoDB + anomaly detection
 │   │   ├── doc_ingest/         # S3 trigger — PDF → chunks → Bedrock → pgvector
-│   │   └── rag_query/          # POST /chat — pgvector retrieval → Nova Lite generation
+│   │   ├── rag_query/          # POST /chat route: documents — pgvector retrieval → Nova Lite
+│   │   ├── data_query/         # POST /chat route: data — NL → intent → DynamoDB → response
+│   │   ├── anomaly_query/      # POST /chat route: anomalies — fetch + Nova Lite narrative
+│   │   └── chat/               # POST /chat — Nova Lite classifier, routes to above 3
 │   ├── shared/                 # Shared Python utilities (api_response, neon, etc.)
 │   ├── tests/                  # Unit tests (pytest + moto)
 │   └── local_server.py         # Zero-dependency local dev server (port 3001)
@@ -79,23 +82,54 @@ The app uses the **PG&E E-TOU-C** time-of-use rate (Pacific time). All hours in 
 
 ---
 
-## AI document chat
+## AI chat layer
 
-The dashboard includes a chat panel that answers questions from documents you upload (rate plan PDFs, equipment manuals, NEM 3.0 summaries, etc.).
+The dashboard chat panel routes natural-language questions to one of three specialised backends, chosen by a lightweight Nova Lite classifier:
 
-**How it works:**
+| Route | Trigger words / intent | Handler |
+|-------|----------------------|---------|
+| **documents** | How something works, specs, rate rules, equipment policies | `rag_query` |
+| **data** | Specific numbers, history, averages from your system | `data_query` |
+| **anomalies** | Problems, alerts, unusual behaviour, issues | `anomaly_query` |
+
+Off-topic questions are blocked before generation: if the best-matching document chunk has a cosine distance > 0.7, the `rag_query` handler returns a guardrail message instead of calling Nova Lite.
+
+### Route 1 — document RAG (`rag_query`)
 
 1. Upload a PDF to the S3 documents bucket (printed as `DocumentsBucketName` in CDK deploy output).
-2. An S3 event triggers the `doc_ingest` Lambda, which extracts page text, splits it into overlapping 500-word chunks, embeds each chunk with Bedrock Titan Text Embeddings V2, and stores them in Neon pgvector.
-3. When you ask a question in the chat panel, the `rag_query` Lambda embeds your query, retrieves the 5 closest chunks by cosine distance, and generates an answer with Amazon Nova Lite. Each response includes source citations with document name and page number.
+2. An S3 event triggers `doc_ingest`, which splits the PDF into overlapping 500-word chunks, embeds each with Bedrock Titan Text Embeddings V2, and stores them in Neon pgvector with an HNSW cosine index.
+3. At query time, `rag_query` embeds the question, retrieves the 5 nearest chunks, and generates an answer with Nova Lite. Each response includes source citations (document name + page number).
 
-**Uploading a document:**
 ```bash
+# Upload a document
 aws s3 cp your-rate-schedule.pdf s3://<DocumentsBucketName>/your-rate-schedule.pdf
 ```
-Re-uploading the same key re-ingests the document (old chunks are deleted first).
 
-**Local dev:** Set `NEON_CONNECTION_STRING` in `backend/.env` to skip SSM lookup. The `doc_ingest` and `rag_query` handlers are available via POST `/api/chat` on the local server. Note: pg8000 must be installed (`pip install pg8000 pypdf`) for these routes to load.
+Re-uploading the same key re-ingests (old chunks deleted first).
+
+### Route 2 — data queries (`data_query`)
+
+Handles questions about historical energy readings stored in DynamoDB:
+
+- "How much did I produce yesterday?" → total daily `energy_wh`
+- "What was my average battery SOC last week?" → averaged `battery_soc_pct`
+- "Which day had the most solar this month?" → maximum daily production
+
+Nova Lite extracts a structured intent (`metric`, `aggregation`, `start_date`, `end_date`) from the question. Python then executes the query against DynamoDB and formats a plain-English response. The LLM never touches DynamoDB directly — only the extracted intent drives the query.
+
+### Route 3 — anomaly detection (`anomaly_query`)
+
+The hourly `ingest` Lambda runs rule-based anomaly detection after each Enphase snapshot and writes flagged events to the `solar-ev-anomalies` DynamoDB table (30-day TTL):
+
+| Anomaly | Condition |
+|---------|-----------|
+| `no_production` (high severity) | Zero power output during solar peak (10:00–14:00) with < 50% cloud cover |
+| `low_production` (medium severity) | < 1 kW during solar peak with < 20% cloud cover |
+| `battery_critically_low` (medium severity) | Battery SOC < 10% at any time |
+
+When you ask about problems or anomalies, `anomaly_query` fetches recent events from DynamoDB and has Nova Lite write a natural-language summary. If no anomalies exist, the system confirms everything looks healthy.
+
+**Local dev:** Set `NEON_CONNECTION_STRING` in `backend/.env` to skip SSM lookup. All three sub-handlers load automatically in the local server; the `/chat` route uses `_classify` directly (no boto3 Lambda.invoke needed). Note: pg8000 must be installed (`pip install pg8000 pypdf`) for `rag_query` to load.
 
 ---
 
@@ -186,7 +220,7 @@ pytest tests/ -v
 
 All AWS calls are mocked with `moto` — no credentials or live infrastructure needed.
 
-Covered: `solar_data`, `recommendation`, `ingest`, `doc_ingest`, and `rag_query` Lambda handlers (including SSM helpers, OAuth token refresh, Enphase API calls, battery SOC, OpenWeatherMap fetch, curtailment alert logic, PDF chunking with page tracking, pgvector retrieval, and Bedrock generation) plus shared utilities.
+Covered: `solar_data`, `recommendation`, `ingest`, `doc_ingest`, `rag_query`, `data_query`, `chat`, and `anomaly_query` Lambda handlers — including SSM helpers, OAuth token refresh, Enphase API calls, battery SOC, OpenWeatherMap fetch, curtailment alert logic, PDF chunking with page tracking, pgvector retrieval, Bedrock generation, intent extraction and DynamoDB aggregation logic, chat routing (all three routes + fallback), anomaly detection rules (boundary conditions, peak/off-peak, weather data absent), and anomaly query summarisation.
 
 ### Frontend (TypeScript — Vitest + Testing Library)
 
@@ -330,15 +364,19 @@ EventBridge (hourly)
   │    data/2.5/weather  (OWM)       │
   │ 5. Write snapshot to DynamoDB    │
   │    with 90-day TTL               │
-  │ 6. If battery ≥ 95% + solar      │
+  │ 6. Rule-based anomaly detection  │
+  │    → write to anomalies table    │
+  │ 7. If battery ≥ 95% + solar      │
   │    curtailed → POST ntfy.sh alert│
   └──────────────────────────────────┘
-        │
-        ▼
-  DynamoDB: solar-ev-energy-readings
-  PK: enphase-{system_id}  SK: timestamp (UTC ISO-8601)
-  Fields: energy_wh, power_w, summary_date (Pacific),
-          battery_soc_pct, cloud_cover_pct, temp_c, weather_condition
+        │                    │
+        ▼                    ▼
+  DynamoDB:           DynamoDB:
+  solar-ev-energy-    solar-ev-anomalies
+  readings            PK: system_id
+  PK: enphase-{id}    SK: timestamp
+  SK: timestamp       30-day TTL
+  90-day TTL
         │
         ├──────────────────────┐
         ▼                      ▼
@@ -352,9 +390,18 @@ EventBridge (hourly)
         └──────────┬───────────┘
                    ▼
             API Gateway
-                   │
                    ▼
            React frontend
+                   ▼
+           POST /chat
+                   │
+            chat Lambda (Nova Lite classifier)
+           ┌───────┼───────────┐
+           ▼       ▼           ▼
+      rag_query  data_query  anomaly_query
+      (documents) (data)     (anomalies)
+      pgvector   DynamoDB    anomalies
+      + Bedrock  intent→SQL  table + Bedrock
 ```
 
 ### UTC vs. Pacific time
@@ -413,10 +460,9 @@ print(json.dumps(handler.lambda_handler({}, None), indent=2))
 
 | Feature | Where to start |
 |---------|---------------|
-| Text-to-query over DynamoDB | New Lambda: translate natural language → DynamoDB query → return tabular data; route via chat |
-| Combined chat routing | Router Lambda that classifies query as "document lookup" vs. "data query" and delegates accordingly |
-| Anomaly detection + LLM explanation | Flag unusual production/consumption in ingest Lambda; store anomalies; surface in chat |
 | Weather-adjusted solar forecast | Use `cloud_cover_pct` already stored per hour — adjust solar estimate in `recommendation` handler |
+| Fetch battery SOC from Enphase API | Update `ingest` handler to call `/api/v4/systems/{id}/telemetry/battery`; feed real SOC into recommendation |
 | User config (custom charge rate, schedule prefs) | `backend/functions/recommendation/handler.py` + `solar-ev-user-config` table |
 | EV charger scheduling | Enphase EVSE API requires a higher API tier; alternative: Home Assistant integration |
 | Host frontend on S3 + CloudFront | Add `S3Bucket` + `CloudFrontDistribution` to CDK stack |
+| Richer anomaly rules | Extend `_detect_anomalies` in `ingest/handler.py` — e.g. grid export when EV could be charging, unexpected overnight battery drain |
