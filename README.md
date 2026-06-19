@@ -461,7 +461,6 @@ print(json.dumps(handler.lambda_handler({}, None), indent=2))
 | Feature | Where to start |
 |---------|---------------|
 | Weather-adjusted solar forecast | Use `cloud_cover_pct` already stored per hour — adjust solar estimate in `recommendation` handler |
-| Fetch battery SOC from Enphase API | Update `ingest` handler to call `/api/v4/systems/{id}/telemetry/battery`; feed real SOC into recommendation |
 | User config (custom charge rate, schedule prefs) | `backend/functions/recommendation/handler.py` + `solar-ev-user-config` table |
 | EV charger scheduling | Enphase EVSE API requires a higher API tier; alternative: Home Assistant integration |
 | Host frontend on S3 + CloudFront | Add `S3Bucket` + `CloudFrontDistribution` to CDK stack |
