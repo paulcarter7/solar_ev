@@ -352,11 +352,37 @@ export class SolarEvStack extends cdk.Stack {
       new apigateway.LambdaIntegration(recommendationFn, { proxy: true })
     );
 
+    // -------------------------------------------------------------------------
+    // Lambda: chat — classifies query and routes to rag_query or data_query
+    // -------------------------------------------------------------------------
+    const chatFn = new lambda.Function(this, "ChatFn", {
+      functionName: "solar-ev-chat",
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: "handler.lambda_handler",
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, "../../backend/functions/chat")
+      ),
+      environment: {
+        BEDROCK_REGION: BEDROCK_REGION,
+        BEDROCK_GENERATION_MODEL: "us.amazon.nova-lite-v1:0",
+        RAG_QUERY_FUNCTION_NAME: ragQueryFn.functionName,
+        DATA_QUERY_FUNCTION_NAME: dataQueryFn.functionName,
+      },
+      timeout: cdk.Duration.seconds(60),
+      memorySize: 256,
+      logRetention: logs.RetentionDays.ONE_MONTH,
+      description: "Routes chat queries to rag_query (documents) or data_query (DynamoDB)",
+    });
+
+    chatFn.addToRolePolicy(bedrockPolicy);
+    ragQueryFn.grantInvoke(chatFn);
+    dataQueryFn.grantInvoke(chatFn);
+
     // POST /chat
-    const chat = api.root.addResource("chat");
-    chat.addMethod(
+    const chatResource = api.root.addResource("chat");
+    chatResource.addMethod(
       "POST",
-      new apigateway.LambdaIntegration(ragQueryFn, { proxy: true })
+      new apigateway.LambdaIntegration(chatFn, { proxy: true })
     );
 
     // -------------------------------------------------------------------------

@@ -83,22 +83,67 @@ def _build_routes() -> tuple[dict, dict]:
     }
     post_routes = {}
 
+    # Load sub-handlers so the local chat router can call them directly
+    # (avoids boto3 Lambda.invoke which doesn't work in local dev)
+    rag_handler = None
+    data_handler = None
+
     try:
-        post_routes["/chat"] = _load_handler_from_file(
-            os.path.join(fn_dir, "rag_query", "handler.py"),
-            "rag_query_handler",
+        rag_handler = _load_handler_from_file(
+            os.path.join(fn_dir, "rag_query", "handler.py"), "rag_query_handler",
         )
     except Exception as exc:
         print(f"  Warning: could not load rag_query handler ({exc})")
-        print("  Install pg8000 to enable POST /chat locally.")
+        print("  Install pg8000 to enable document queries locally.")
 
     try:
-        post_routes["/data-query"] = _load_handler_from_file(
-            os.path.join(fn_dir, "data_query", "handler.py"),
-            "data_query_handler",
+        data_handler = _load_handler_from_file(
+            os.path.join(fn_dir, "data_query", "handler.py"), "data_query_handler",
         )
     except Exception as exc:
         print(f"  Warning: could not load data_query handler ({exc})")
+
+    if rag_handler or data_handler:
+        chat_module = _load_handler_from_file(
+            os.path.join(fn_dir, "chat", "handler.py"), "chat_handler", attr="lambda_handler",
+        )
+
+        def _local_chat(event, context):
+            import json as _json
+            try:
+                body = _json.loads(event.get("body") or "{}")
+                query = (body.get("query") or "").strip()
+            except Exception:
+                return chat_module(event, context)
+
+            # Import classify directly from the loaded chat module
+            import importlib
+            chat_mod = importlib.import_module("chat_handler")
+            try:
+                route = chat_mod._classify(query)
+            except Exception:
+                route = "documents"
+
+            if route == "data" and data_handler:
+                result = data_handler(event, context)
+            elif rag_handler:
+                result = rag_handler(event, context)
+            else:
+                return {"statusCode": 503, "body": _json.dumps({"error": "No handlers available"})}
+
+            try:
+                inner = _json.loads(result.get("body", "{}"))
+                inner["route"] = route
+                result["body"] = _json.dumps(inner)
+            except Exception:
+                pass
+            return result
+
+        post_routes["/chat"] = _local_chat
+
+    post_routes["/data-query"] = data_handler or (
+        lambda e, c: {"statusCode": 503, "body": '{"error": "data_query not loaded"}'}
+    )
 
     return get_routes, post_routes
 
