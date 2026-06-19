@@ -30,7 +30,7 @@ _bedrock = boto3.client(
 _lambda = boto3.client("lambda")
 
 _CLASSIFY_SYSTEM = """\
-Classify a home energy system question as either "documents" or "data".
+Classify a home energy system question as "documents", "data", or "anomalies".
 
 documents — asks about how something works, rates, specs, policies, or equipment:
   "What are peak hours on my rate plan?"
@@ -43,7 +43,14 @@ data — asks about specific measurements, history, or numbers from the system:
   "Which day last month had the most solar?"
   "What's my average daily production this week?"
 
-Reply with exactly one word: documents or data.
+anomalies — asks about problems, issues, alerts, or unusual behaviour:
+  "Were there any problems this week?"
+  "Why was my production low yesterday?"
+  "Any anomalies recently?"
+  "Has anything unusual happened with my system?"
+  "Are there any alerts?"
+
+Reply with exactly one word: documents, data, or anomalies.
 """
 
 
@@ -62,8 +69,11 @@ def _classify(query: str) -> str:
     )
     raw = json.loads(resp["body"].read())["output"]["message"]["content"][0]["text"]
     result = raw.strip().lower()
-    # Default to documents if the model returns anything unexpected
-    return "data" if result.startswith("data") else "documents"
+    if result.startswith("data"):
+        return "data"
+    if result.startswith("anomal"):
+        return "anomalies"
+    return "documents"
 
 
 def _invoke_lambda(function_name: str, event: dict) -> dict:
@@ -95,6 +105,8 @@ def lambda_handler(event: dict, context) -> dict:
 
         if route == "data":
             function_name = os.environ["DATA_QUERY_FUNCTION_NAME"]
+        elif route == "anomalies":
+            function_name = os.environ["ANOMALY_QUERY_FUNCTION_NAME"]
         else:
             function_name = os.environ["RAG_QUERY_FUNCTION_NAME"]
 

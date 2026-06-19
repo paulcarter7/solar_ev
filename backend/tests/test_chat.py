@@ -20,6 +20,7 @@ chat = load_handler("chat")
 ENV = {
     "RAG_QUERY_FUNCTION_NAME": "solar-ev-rag-query",
     "DATA_QUERY_FUNCTION_NAME": "solar-ev-data-query",
+    "ANOMALY_QUERY_FUNCTION_NAME": "solar-ev-anomaly-query",
 }
 
 
@@ -69,6 +70,11 @@ class TestClassify(unittest.TestCase):
         with self._mock_invoke("data"):
             result = chat._classify("How much did I produce yesterday?")
         self.assertEqual(result, "data")
+
+    def test_anomalies_query(self):
+        with self._mock_invoke("anomalies"):
+            result = chat._classify("Were there any problems this week?")
+        self.assertEqual(result, "anomalies")
 
     def test_unexpected_output_defaults_to_documents(self):
         with self._mock_invoke("I'm not sure"):
@@ -142,6 +148,22 @@ class TestLambdaHandler(unittest.TestCase):
         body = json.loads(result["body"])
         self.assertIn("route", body)
         self.assertEqual(body["route"], "documents")
+
+    def test_anomaly_query_invokes_anomaly_lambda(self):
+        anomaly_body = {"response": "One issue found.", "anomalies": []}
+        with (
+            patch.dict(os.environ, ENV),
+            self._mock_classify("anomalies"),
+            patch.object(chat, "_invoke_lambda",
+                         return_value={"statusCode": 200, "body": json.dumps(anomaly_body)}) as mock_invoke,
+        ):
+            result = chat.lambda_handler(_event({"query": "Any problems recently?"}), None)
+
+        self.assertEqual(result["statusCode"], 200)
+        mock_invoke.assert_called_once_with(ENV["ANOMALY_QUERY_FUNCTION_NAME"],
+                                            _event({"query": "Any problems recently?"}))
+        body = json.loads(result["body"])
+        self.assertEqual(body["route"], "anomalies")
 
     def test_missing_function_name_env_returns_503(self):
         with (

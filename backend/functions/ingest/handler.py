@@ -399,6 +399,87 @@ def _write_reading(
 
 
 # ---------------------------------------------------------------------------
+# Anomaly detection
+# ---------------------------------------------------------------------------
+
+# Hours (Pacific, inclusive) when the 6.6 kW system should be producing meaningfully.
+_SOLAR_PEAK_START = 10
+_SOLAR_PEAK_END   = 14  # exclusive
+
+def _detect_anomalies(
+    power_w: int,
+    cloud_cover_pct: int | None,
+    battery_soc_pct: int | None,
+    local_hour: int,
+) -> list[dict]:
+    """
+    Return a list of anomaly dicts for the current reading.
+    Rules are deterministic — no LLM involved here.
+    """
+    anomalies: list[dict] = []
+    in_peak = _SOLAR_PEAK_START <= local_hour < _SOLAR_PEAK_END
+
+    if in_peak and cloud_cover_pct is not None:
+        if cloud_cover_pct < 50 and power_w == 0:
+            anomalies.append({
+                "type": "no_production",
+                "severity": "high",
+                "description": (
+                    f"Zero solar output at {local_hour:02d}:00 with only "
+                    f"{cloud_cover_pct}% cloud cover — inverter may be offline."
+                ),
+            })
+        elif cloud_cover_pct < 20 and 0 < power_w < 1000:
+            anomalies.append({
+                "type": "low_production",
+                "severity": "medium",
+                "description": (
+                    f"Only {power_w}W at {local_hour:02d}:00 with {cloud_cover_pct}% "
+                    f"cloud cover — expected >1 kW on a clear midday."
+                ),
+            })
+
+    if battery_soc_pct is not None and battery_soc_pct < 10:
+        anomalies.append({
+            "type": "battery_critically_low",
+            "severity": "medium",
+            "description": f"Home battery at {battery_soc_pct}% — critically low.",
+        })
+
+    return anomalies
+
+
+def _write_anomalies(
+    table,
+    system_id: str,
+    timestamp: str,
+    power_w: int,
+    cloud_cover_pct: int | None,
+    battery_soc_pct: int | None,
+    anomalies: list[dict],
+) -> None:
+    """Write one row per anomaly to the anomaly table with a 30-day TTL."""
+    now = datetime.now(timezone.utc)
+    ttl = int((now + timedelta(days=30)).timestamp())
+    for anomaly in anomalies:
+        item = {
+            "systemId":        f"enphase-{system_id}",
+            "timestamp":       timestamp,
+            "type":            anomaly["type"],
+            "severity":        anomaly["severity"],
+            "description":     anomaly["description"],
+            "power_w":         power_w,
+            "ttl":             ttl,
+        }
+        if cloud_cover_pct is not None:
+            item["cloud_cover_pct"] = cloud_cover_pct
+        if battery_soc_pct is not None:
+            item["battery_soc_pct"] = battery_soc_pct
+        table.put_item(Item=item)
+        logger.info("Anomaly recorded: %s — %s", anomaly["type"], anomaly["description"])
+
+
+# ---------------------------------------------------------------------------
 # Curtailment alert
 # ---------------------------------------------------------------------------
 
@@ -579,6 +660,28 @@ def lambda_handler(event: dict, context) -> dict:
 
         table = _dynamo.Table(table_name)
         _write_reading(table, system_id, summary, battery_soc_pct=battery_soc_pct, weather=weather)
+
+        # Anomaly detection — non-fatal if table not configured
+        anomaly_table_name = os.environ.get("ANOMALY_TABLE", "")
+        if anomaly_table_name:
+            try:
+                anomalies = _detect_anomalies(
+                    power_w=summary.get("current_power", 0),
+                    cloud_cover_pct=weather.get("cloud_cover_pct") if weather else None,
+                    battery_soc_pct=battery_soc_pct,
+                    local_hour=local_hour,
+                )
+                if anomalies:
+                    ts = datetime.now(timezone.utc).isoformat()
+                    _write_anomalies(
+                        _dynamo.Table(anomaly_table_name), system_id, ts,
+                        power_w=summary.get("current_power", 0),
+                        cloud_cover_pct=weather.get("cloud_cover_pct") if weather else None,
+                        battery_soc_pct=battery_soc_pct,
+                        anomalies=anomalies,
+                    )
+            except Exception as exc:
+                logger.warning("Anomaly detection failed (non-fatal): %s", exc)
 
         # Alert if battery full and solar is being curtailed
         ntfy_topic = _resolve_ntfy_topic()

@@ -87,6 +87,7 @@ def _build_routes() -> tuple[dict, dict]:
     # (avoids boto3 Lambda.invoke which doesn't work in local dev)
     rag_handler = None
     data_handler = None
+    anomaly_handler = None
 
     try:
         rag_handler = _load_handler_from_file(
@@ -103,10 +104,20 @@ def _build_routes() -> tuple[dict, dict]:
     except Exception as exc:
         print(f"  Warning: could not load data_query handler ({exc})")
 
-    if rag_handler or data_handler:
+    try:
+        anomaly_handler = _load_handler_from_file(
+            os.path.join(fn_dir, "anomaly_query", "handler.py"), "anomaly_query_handler",
+        )
+        post_routes["/anomalies"] = anomaly_handler
+    except Exception as exc:
+        print(f"  Warning: could not load anomaly_query handler ({exc})")
+
+    if rag_handler or data_handler or anomaly_handler:
+        import importlib
         chat_module = _load_handler_from_file(
             os.path.join(fn_dir, "chat", "handler.py"), "chat_handler", attr="lambda_handler",
         )
+        chat_mod = importlib.import_module("chat_handler")
 
         def _local_chat(event, context):
             import json as _json
@@ -116,9 +127,6 @@ def _build_routes() -> tuple[dict, dict]:
             except Exception:
                 return chat_module(event, context)
 
-            # Import classify directly from the loaded chat module
-            import importlib
-            chat_mod = importlib.import_module("chat_handler")
             try:
                 route = chat_mod._classify(query)
             except Exception:
@@ -126,6 +134,8 @@ def _build_routes() -> tuple[dict, dict]:
 
             if route == "data" and data_handler:
                 result = data_handler(event, context)
+            elif route == "anomalies" and anomaly_handler:
+                result = anomaly_handler(event, context)
             elif rag_handler:
                 result = rag_handler(event, context)
             else:

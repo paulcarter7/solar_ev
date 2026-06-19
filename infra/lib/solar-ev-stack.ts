@@ -33,6 +33,17 @@ export class SolarEvStack extends cdk.Stack {
       timeToLiveAttribute: "ttl", // auto-expire readings older than 90 days
     });
 
+    // Stores anomalies detected during ingest (low/no production, battery issues).
+    // PK: systemId  SK: timestamp (ISO-8601 UTC). 30-day TTL.
+    const anomalyTable = new dynamodb.Table(this, "AnomalyReadings", {
+      tableName: "solar-ev-anomalies",
+      partitionKey: { name: "systemId", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "timestamp", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      timeToLiveAttribute: "ttl",
+    });
+
     // Stores user configuration: utility rates, EV specs, notification prefs.
     // PK: userId  SK: configType (e.g. "utility", "ev", "notifications")
     const configTable = new dynamodb.Table(this, "UserConfig", {
@@ -134,6 +145,7 @@ export class SolarEvStack extends cdk.Stack {
       ),
       environment: {
         ...sharedEnv,
+        ANOMALY_TABLE: anomalyTable.tableName,
         // Non-sensitive config — safe as plain env vars
         ENPHASE_SYSTEM_ID: "6046451",
         LOCATION_LAT: "37.8216",
@@ -154,6 +166,7 @@ export class SolarEvStack extends cdk.Stack {
     });
 
     energyTable.grantReadWriteData(ingestFn);
+    anomalyTable.grantWriteData(ingestFn);
     // Ingest writes de-dup records to config table to prevent alert spam
     configTable.grantReadWriteData(ingestFn);
 
@@ -367,6 +380,7 @@ export class SolarEvStack extends cdk.Stack {
         BEDROCK_GENERATION_MODEL: "us.amazon.nova-lite-v1:0",
         RAG_QUERY_FUNCTION_NAME: ragQueryFn.functionName,
         DATA_QUERY_FUNCTION_NAME: dataQueryFn.functionName,
+        ANOMALY_QUERY_FUNCTION_NAME: anomalyQueryFn.functionName,
       },
       timeout: cdk.Duration.seconds(60),
       memorySize: 256,
@@ -377,6 +391,7 @@ export class SolarEvStack extends cdk.Stack {
     chatFn.addToRolePolicy(bedrockPolicy);
     ragQueryFn.grantInvoke(chatFn);
     dataQueryFn.grantInvoke(chatFn);
+    anomalyQueryFn.grantInvoke(chatFn);
 
     // POST /chat
     const chatResource = api.root.addResource("chat");
@@ -414,6 +429,38 @@ export class SolarEvStack extends cdk.Stack {
     dataQuery.addMethod(
       "POST",
       new apigateway.LambdaIntegration(dataQueryFn, { proxy: true })
+    );
+
+    // -------------------------------------------------------------------------
+    // Lambda: anomaly_query — summarises detected anomalies with Nova Lite
+    // -------------------------------------------------------------------------
+    const anomalyQueryFn = new lambda.Function(this, "AnomalyQueryFn", {
+      functionName: "solar-ev-anomaly-query",
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: "handler.lambda_handler",
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, "../../backend/functions/anomaly_query")
+      ),
+      environment: {
+        ...sharedEnv,
+        ANOMALY_TABLE: anomalyTable.tableName,
+        BEDROCK_REGION: BEDROCK_REGION,
+        BEDROCK_GENERATION_MODEL: "us.amazon.nova-lite-v1:0",
+      },
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 256,
+      logRetention: logs.RetentionDays.ONE_MONTH,
+      description: "Queries anomaly table and summarises issues with Nova Lite",
+    });
+
+    anomalyTable.grantReadData(anomalyQueryFn);
+    anomalyQueryFn.addToRolePolicy(bedrockPolicy);
+
+    // POST /anomalies
+    const anomalies = api.root.addResource("anomalies");
+    anomalies.addMethod(
+      "POST",
+      new apigateway.LambdaIntegration(anomalyQueryFn, { proxy: true })
     );
 
     // -------------------------------------------------------------------------
